@@ -536,6 +536,17 @@ update_sequence_numbers(int64_t loop_start_time,
         }
     }
 }
+
+static bool
+sb_cfg_is_updated(struct ovsdb_idl *ovnnb_idl,
+                  struct ovsdb_idl_loop *sb_loop)
+{
+    const struct nbrec_nb_global *nb = nbrec_nb_global_first(ovnnb_idl);
+
+    return (nb && sb_loop->cur_cfg && nb->sb_cfg != sb_loop->cur_cfg)
+           ? true : false;
+}
+
 
 static void
 usage(void)
@@ -853,6 +864,7 @@ main(int argc, char *argv[])
             simap_destroy(&usage);
         }
 
+        bool clear_idl_track = true;
         if (!state.paused) {
             if (!ovsdb_idl_has_lock(ovnsb_idl_loop.idl) &&
                 !ovsdb_idl_is_lock_contended(ovnsb_idl_loop.idl))
@@ -903,8 +915,25 @@ main(int argc, char *argv[])
 
             if (ovsdb_idl_has_lock(ovnsb_idl_loop.idl)) {
                 int64_t loop_start_time = time_wall_msec();
-                inc_proc_northd_run(ovnnb_txn, ovnsb_txn, recompute);
-                recompute = false;
+
+                /* Check if sb_cfg can be propagated.
+                   Meaning is that engine already made a bunch of updates and
+                   those updated are already committed to SB DB.
+                   So, it's time to bump sb_cfg in the NB DB.
+                   However, engine will run again as response to 'update3'
+                   notification from server that reflects our recent 'transact'.
+                   This will delay sb_cfg bump for inapropriate long time.
+                   So, solution is to skip engine run for this iteration and make
+                   bump transaction that delivers sb_cfg immediately.
+                   Engine will be ran diring the next iteration.
+                   For this run we preserve tracked info (see clear_idl_track) */
+                if (!sb_cfg_is_updated(ovnnb_idl_loop.idl,&ovnsb_idl_loop)) {
+                    inc_proc_northd_run(ovnnb_txn, ovnsb_txn, recompute);
+                    recompute = false;
+                } else {
+                    clear_idl_track = false;
+                }
+
                 if (ovnsb_txn) {
                     check_and_add_supported_dhcp_opts_to_sb_db(
                                  ovnsb_txn, ovnsb_idl_loop.idl);
@@ -968,8 +997,10 @@ main(int argc, char *argv[])
             recompute = true;
         }
 
-        ovsdb_idl_track_clear(ovnnb_idl_loop.idl);
-        ovsdb_idl_track_clear(ovnsb_idl_loop.idl);
+        if (clear_idl_track) {
+            ovsdb_idl_track_clear(ovnnb_idl_loop.idl);
+            ovsdb_idl_track_clear(ovnsb_idl_loop.idl);
+        }
 
         unixctl_server_run(unixctl);
         unixctl_server_wait(unixctl);
