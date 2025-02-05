@@ -490,6 +490,7 @@ bool inc_proc_northd_run(struct ovsdb_idl_txn *ovnnb_txn,
         VLOG_DBG("engine was canceled, force recompute next time.");
         engine_set_force_recompute_immediate();
     } else {
+        VLOG_DBG("Engine has ran successfully.");
         engine_clear_force_recompute();
     }
 

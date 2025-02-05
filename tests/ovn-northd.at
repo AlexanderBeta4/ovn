@@ -14823,3 +14823,22 @@ AT_CHECK([ovn-sbctl lflow-list sw | grep ls_out_acl_eval | grep priority=2002 | 
 
 AT_CLEANUP
 ])
+
+OVN_FOR_EACH_NORTHD_NO_HV([
+AT_SETUP([sb_cfg propagation])
+
+ovn_start
+
+rm -f northd/ovn-northd.log
+check as northd ovn-appctl -t ovn-northd vlog/reopen
+check as northd ovn-appctl -t ovn-northd vlog/set jsonrpc:dbg
+check as northd ovn-appctl -t ovn-northd vlog/set inc_proc_northd:dbg
+
+check ovn-nbctl ls-add sw1 -- set nb_global . nb_cfg=1
+wait_column 1 nb:nb_global sb_cfg
+
+call_seq=`grep -E "(transact.*sb_cfg)|(transact.*Southbound)|(has ran)" northd/ovn-northd.log | cut -d "|" -f 5- | cut -b 1 | tr -d '\n'`
+AT_CHECK([test x`echo $call_seq` = xEEuuE])
+
+AT_CLEANUP
+])
