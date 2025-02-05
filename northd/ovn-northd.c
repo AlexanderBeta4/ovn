@@ -917,16 +917,17 @@ main(int argc, char *argv[])
                 int64_t loop_start_time = time_wall_msec();
 
                 /* Check if sb_cfg can be propagated.
-                   Meaning is that engine already made a bunch of updates and
-                   those updated are already committed to SB DB.
+                   Meaning is that the engine already made a bunch of updates
+                   and those updated are already committed to SB DB.
                    So, it's time to bump sb_cfg in the NB DB.
-                   However, engine will run again as response to 'update3'
-                   notification from server that reflects our recent 'transact'.
-                   This will delay sb_cfg bump for inapropriate long time.
-                   So, solution is to skip engine run for this iteration and make
-                   bump transaction that delivers sb_cfg immediately.
-                   Engine will be ran diring the next iteration.
-                   For this run we preserve tracked info (see clear_idl_track) */
+                   However, the engine will run again as response to 'update3'
+                   notification from the server that reflects our recent
+                  'transact'. This will delay sb_cfg bump for an inappropriate
+                  long time. So, the solution is to skip engine run for this
+                  iteration and make bump transaction that delivers sb_cfg
+                  immediately. Engine will be run during the next iteration.
+                  We also preserve DB tracked info for the next engine run
+                  (see clear_idl_track). */
                 if (!sb_cfg_is_updated(ovnnb_idl_loop.idl,&ovnsb_idl_loop)) {
                     inc_proc_northd_run(ovnnb_txn, ovnsb_txn, recompute);
                     recompute = false;
