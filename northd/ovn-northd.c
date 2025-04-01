@@ -708,6 +708,15 @@ run_idl_loop(struct ovsdb_idl_loop *idl_loop, const char *name)
     return txn;
 }
 
+static bool
+sb_cfg_is_in_sync(struct ovsdb_idl *ovnnb_idl,
+                  struct ovsdb_idl_loop *sb_loop)
+{
+    const struct nbrec_nb_global *nb = nbrec_nb_global_first(ovnnb_idl);
+
+    return !(nb && sb_loop->cur_cfg && nb->sb_cfg != sb_loop->cur_cfg);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -832,6 +841,7 @@ main(int argc, char *argv[])
             simap_destroy(&usage);
         }
 
+        bool clear_idl_track = true;
         if (!state.paused) {
             if (!ovsdb_idl_has_lock(ovnsb_idl_loop.idl) &&
                 !ovsdb_idl_is_lock_contended(ovnsb_idl_loop.idl))
@@ -881,24 +891,32 @@ main(int argc, char *argv[])
             }
 
             if (ovsdb_idl_has_lock(ovnsb_idl_loop.idl)) {
-                int64_t loop_start_time = time_wall_msec();
-                inc_proc_northd_run(ovnnb_txn, ovnsb_txn, recompute);
-                recompute = false;
-                if (ovnsb_txn) {
+                if (ovnnb_txn && ovnsb_txn) {
+                    int64_t loop_start_time = time_wall_msec();
+
+                    if (sb_cfg_is_in_sync(ovnnb_idl_loop.idl,
+                                          &ovnsb_idl_loop)) {
+                        inc_proc_northd_run(ovnnb_txn, ovnsb_txn, recompute);
+                        recompute = false;
+                    } else {
+                        poll_immediate_wake();
+                        clear_idl_track = false;
+                    }
+
                     check_and_add_supported_dhcp_opts_to_sb_db(
                                  ovnsb_txn, ovnsb_idl_loop.idl);
                     check_and_add_supported_dhcpv6_opts_to_sb_db(
                                  ovnsb_txn, ovnsb_idl_loop.idl);
                     check_and_update_rbac(
                                  ovnsb_txn, ovnsb_idl_loop.idl);
-                }
 
-                if (ovnnb_txn && ovnsb_txn) {
                     update_sequence_numbers(loop_start_time,
                                             ovnnb_idl_loop.idl,
                                             ovnsb_idl_loop.idl,
                                             ovnnb_txn, ovnsb_txn,
                                             &ovnsb_idl_loop);
+                } else if (!recompute) {
+                    clear_idl_track = false;
                 }
 
                 /* If there are any errors, we force a full recompute in order
@@ -947,8 +965,10 @@ main(int argc, char *argv[])
             recompute = true;
         }
 
-        ovsdb_idl_track_clear(ovnnb_idl_loop.idl);
-        ovsdb_idl_track_clear(ovnsb_idl_loop.idl);
+        if (clear_idl_track) {
+            ovsdb_idl_track_clear(ovnnb_idl_loop.idl);
+            ovsdb_idl_track_clear(ovnsb_idl_loop.idl);
+        }
 
         unixctl_server_run(unixctl);
         unixctl_server_wait(unixctl);
