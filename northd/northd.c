@@ -1421,6 +1421,13 @@ lsp_is_vtep(const struct nbrec_logical_switch_port *nbsp)
 }
 
 static bool
+lsp_is_l2gw(const struct nbrec_logical_switch_port *nbsp)
+{
+    return !strcmp(nbsp->type, "l2gateway");
+}
+
+
+static bool
 localnet_can_learn_mac(const struct nbrec_logical_switch_port *nbsp)
 {
     return smap_get_bool(&nbsp->options, "localnet_learn_fdb", false);
@@ -9373,6 +9380,49 @@ build_lswitch_lflows_admission_control(struct ovn_datapath *od,
 
     ovn_lflow_add(lflows, od, S_SWITCH_IN_APPLY_PORT_SEC, 0, "1", "next;",
                   lflow_ref);
+
+
+    int stage_s1 = 0;
+    int stage_s2 = 0;
+    struct ds match_s0;
+    struct ds match_s1;
+    struct ds match_s2;
+
+    ds_init(&match_s0);
+    ds_init(&match_s1);
+    ds_init(&match_s2);
+
+    struct ovn_port *op;
+    HMAP_FOR_EACH (op, dp_node, &od->ports) {
+        if (lsp_is_vtep(op->nbsp) || lsp_is_localnet(op->nbsp) || lsp_is_l2gw(op->nbsp)) {
+            if (stage_s1) {
+                ds_put_format(&match_s1, " || ");
+            }
+
+            ds_put_format(&match_s1, "inport == %s", op->json_key);
+            stage_s1 = 1;
+        }
+
+        if (op->peer && lrp_is_l3dgw(op->peer)) {
+            if (stage_s2) {
+                ds_put_format(&match_s2, " && ");
+            }
+
+            ds_put_format(&match_s2, "!is_chassis_resident(%s)", op->peer->json_key);
+            stage_s2 = 1;
+        }
+    }
+
+    if (stage_s1 && stage_s2) {
+        ds_put_format(&match_s0, "arp && (%s) && (%s)", ds_cstr(&match_s1), ds_cstr(&match_s2));
+
+        ovn_lflow_add(lflows, od, S_SWITCH_IN_CHECK_PORT_SEC, 81,
+                      ds_cstr(&match_s0), "drop;", lflow_ref);
+    }
+
+    ds_destroy(&match_s0);
+    ds_destroy(&match_s1);
+    ds_destroy(&match_s2);
 }
 
 /* Ingress table 19: ARP/ND responder, skip requests coming from localnet
@@ -13414,8 +13464,6 @@ build_neigh_learning_flows_for_lrouter(
                   " = lookup_arp(inport, arp.spa, arp.sha); %s%snext;",
                   learn_from_arp_request ? "" :
                   REGBIT_LOOKUP_NEIGHBOR_IP_RESULT" = 1; ", flood);
-    ovn_lflow_add(lflows, od, S_ROUTER_IN_LOOKUP_NEIGHBOR, 100,
-                  "arp.op == 2", ds_cstr(actions), lflow_ref);
 
     ds_clear(actions);
     ds_put_format(actions, REGBIT_LOOKUP_NEIGHBOR_RESULT
@@ -13524,7 +13572,7 @@ build_neigh_learning_flows_for_lrouter_port(
             ds_clear(match);
             ds_put_format(match,
                           "inport == %s && arp.spa == %s/%u && "
-                          "arp.tpa == %s && arp.op == 1",
+                          "arp.tpa == %s && arp.op",
                           op->json_key,
                           op->lrp_networks.ipv4_addrs[i].network_s,
                           op->lrp_networks.ipv4_addrs[i].plen,
@@ -13545,7 +13593,7 @@ build_neigh_learning_flows_for_lrouter_port(
         }
         ds_clear(match);
         ds_put_format(match,
-                      "inport == %s && arp.spa == %s/%u && arp.op == 1",
+                      "inport == %s && arp.spa == %s/%u && arp.op",
                       op->json_key,
                       op->lrp_networks.ipv4_addrs[i].network_s,
                       op->lrp_networks.ipv4_addrs[i].plen);
