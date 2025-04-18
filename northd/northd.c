@@ -9632,21 +9632,6 @@ has_residents(struct ovn_datapath *od)
         if (lrp_is_l3dgw(op_r)) {
             return true;
         }
-
-        for (int ni = 0; ni < op_r->od->nbr->n_nat; ni++) {
-            struct nbrec_nat *nat = op_r->od->nbr->nat[ni];
-
-            /* Determine whether this NAT rule satisfies the
-             * conditions for distributed NAT processing.
-             */
-            if (is_nat_gateway_port(nat, op_r)
-                && op_r->od->n_l3dgw_ports
-                && strcmp(nat->type, "dnat_and_snat") == 0
-                && nat->logical_port
-                && nat->external_mac) {
-                return true;
-            }
-        }
     }
 
     return false;
@@ -9701,26 +9686,25 @@ build_lswitch_arp_chassis_resident(struct lflow_table *lflows,
                           op_r->cr_port->json_key);
             ovn_lflow_add(lflows, od, S_SWITCH_IN_APPLY_PORT_SEC, 75,
                           ds_cstr(&match), "next;", lflow_ref);
-        }
 
-        for (int ni = 0; ni < op_r->od->nbr->n_nat; ni++) {
-            struct nbrec_nat *nat = op_r->od->nbr->nat[ni];
+            for (int ni = 0; ni < op_r->od->nbr->n_nat; ni++) {
+                struct nbrec_nat *nat = op_r->od->nbr->nat[ni];
 
-            /* Determine whether this NAT rule satisfies the
-             * conditions for distributed NAT processing.
-             */
-            if (is_nat_gateway_port(nat, op_r)
-                && op_r->od->n_l3dgw_ports
-                && strcmp(nat->type, "dnat_and_snat") == 0
-                && nat->logical_port
-                && nat->external_mac) {
-                ds_clear(&match);
-                ds_put_format(&match,
-                              REGBIT_EXT_ARP
-                              " == 1 && is_chassis_resident(\"%s\")",
-                              nat->logical_port);
-                ovn_lflow_add(lflows, od, S_SWITCH_IN_APPLY_PORT_SEC, 75,
-                              ds_cstr(&match), "next;", lflow_ref);
+                /* Determine whether this NAT rule satisfies the
+                 * conditions for distributed NAT processing.
+                 */
+                if (is_nat_gateway_port(nat, op_r)
+                    && strcmp(nat->type, "dnat_and_snat") == 0
+                    && nat->logical_port
+                    && nat->external_mac) {
+                    ds_clear(&match);
+                    ds_put_format(&match,
+                                  REGBIT_EXT_ARP
+                                  " == 1 && is_chassis_resident(\"%s\")",
+                                  nat->logical_port);
+                    ovn_lflow_add(lflows, od, S_SWITCH_IN_APPLY_PORT_SEC, 75,
+                                  ds_cstr(&match), "next;", lflow_ref);
+                }
             }
         }
     }
