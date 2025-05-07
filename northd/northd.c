@@ -9626,8 +9626,9 @@ build_drop_arp_nd_flows_for_unbound_router_ports(struct ovn_port *op,
 static bool
 has_residents(struct ovn_datapath *od)
 {
-    for (int rpi = 0; rpi < od->n_router_ports; rpi++) {
-        struct ovn_port *op_r = od->router_ports[rpi]->peer;
+    struct ovn_port *op;
+    VECTOR_FOR_EACH (&od->router_ports, op) {
+        struct ovn_port *op_r = op->peer;
 
         if (lrp_is_l3dgw(op_r)) {
             return true;
@@ -9664,7 +9665,7 @@ build_lswitch_arp_chassis_resident(struct lflow_table *lflows,
 
         if (lsp_is_localnet(nbsp) || lsp_is_l2gw(nbsp)) {
             ds_clear(&match);
-            ds_put_format(&match, "arp.op && inport == \"%s\"", nbsp->name);
+            ds_put_format(&match, "(arp.op == 1 || arp.op == 2) && inport == \"%s\"", nbsp->name);
             ovn_lflow_add(lflows, od, S_SWITCH_IN_CHECK_PORT_SEC, 75,
                           ds_cstr(&match), REGBIT_EXT_ARP" = 1; next;",
                           lflow_ref);
@@ -9676,8 +9677,10 @@ build_lswitch_arp_chassis_resident(struct lflow_table *lflows,
         return;
     }
 
-    for (int rpi = 0; rpi < od->n_router_ports; rpi++) {
-        struct ovn_port *op_r = od->router_ports[rpi]->peer;
+    struct ovn_port *op;
+
+    VECTOR_FOR_EACH (&od->router_ports, op) {
+        struct ovn_port *op_r = op->peer;
 
         if (lrp_is_l3dgw(op_r)) {
             ds_clear(&match);

@@ -43521,6 +43521,8 @@ AT_CHECK([grep -q "Postponing virtual lport sw0-vir" hv2/ovn-controller.log ])
 AT_CHECK([grep -q "Postponing virtual lport sw0-vir" hv3/ovn-controller.log], [1])
 
 OVN_CLEANUP([hv1])
+AT_CLEANUP
+])
 
 AT_SETUP([GARP delivery: gw and extenal ports])
 ovn_start
