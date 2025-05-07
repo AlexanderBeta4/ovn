@@ -43482,6 +43482,9 @@ check ovn-nbctl lsp-set-type sw0-vir virtual
 check ovn-nbctl set logical_switch_port sw0-vir options:virtual-ip=10.0.0.10
 check ovn-nbctl set logical_switch_port sw0-vir options:virtual-parents="sw0-p1,sw0-p2,sw0-p3"
 
+wait_for_ports_up
+check ovn-nbctl --wait=hv sync
+
 # Claim virtual port on hv1.
 send_garp hv1 hv1-vif1 1 "50:54:00:00:00:01" "ff:ff:ff:ff:ff:ff" 10.0.0.10 10.0.0.10
 wait_row_count Port_Binding 1 logical_port=sw0-vir chassis=$(fetch_column Chassis _uuid name=hv1)
