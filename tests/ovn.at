@@ -27513,13 +27513,6 @@ send_arp_request 1 0 ${src_mac} $(ip_to_hex 10 0 0 254) $(ip_to_hex 10 0 0 121)
 # Verify that the ARP request is replied to from hv1 and not hv2.
 match_arp_req="priority=92.*${match_r1_metadata}.*arp_tpa=10.0.0.121,arp_op=1"
 
-
-match_arp_req2="priority=92.*arp_tpa=10.0.0.121,arp_op=1"
-
-sleep 2
-as hv1 ovs-ofctl dump-flows br-int | grep -E "${match_arp_req2}"
-
-
 as hv1
 OVS_WAIT_UNTIL([
     pkts_on_rtr1=$(ovs-ofctl dump-flows br-int | \
@@ -27534,16 +27527,19 @@ OVS_WAIT_UNTIL([
     test "0" = "${pkts_on_rtr1}"
 ])
 
-echo ================================
 #ovn-nbctl show
-echo --------------------------------
+#echo --------------------------------
 #ovn-sbctl show
-echo ++++++++++++++++++++++++++++++++
+#echo ++++++++++++++++++++++++++++++++
 #ovn-sbctl lflow-list sw-agg
 #as hv1 ovs-vsctl show
 #ovn-nbctl list nat
-ovn-sbctl lflow-list
+#ovn-sbctl lflow-list
+
+
+#echo ================================
 #ovn-trace 'inport=="sw-agg-ext" && eth.src==00:00:00:00:00:01 && eth.dst==ff:ff:ff:ff:ff:ff && arp.op==1 && arp.tpa==10.0.0.122 && arp.spa==10.0.0.254'
+
 
 # Inject ARP request for FIP2.
 send_arp_request 1 0 ${src_mac} $(ip_to_hex 10 0 0 254) $(ip_to_hex 10 0 0 122)
@@ -27551,14 +27547,14 @@ send_arp_request 1 0 ${src_mac} $(ip_to_hex 10 0 0 254) $(ip_to_hex 10 0 0 122)
 # Verify that the ARP request is replied to from hv2 and not hv1.
 match_arp_req="priority=92.*${match_r1_metadata}.*arp_tpa=10.0.0.122,arp_op=1"
 
-match_arp_req2=".*arp_tpa=10.0.0.122,arp_op=1"
+#match_arp_req2=".*arp_tpa=10.0.0.122,arp_op=1"
 
-sleep 2
-as hv2 ovs-ofctl dump-flows br-int | grep -E "${match_arp_req2}"
+#sleep 2
+#as hv2 ovs-ofctl dump-flows br-int | grep -E "${match_arp_req2}"
 
-echo ++++++++++++++++++++++++++++++++
-sleep 2
-as hv1 ovs-ofctl dump-flows br-int | grep -E "${match_arp_req2}"
+#echo ++++++++++++++++++++++++++++++++
+#sleep 2
+#as hv1 ovs-ofctl dump-flows br-int | grep -E "${match_arp_req2}"
 
 as hv2
 OVS_WAIT_UNTIL([
@@ -43606,7 +43602,8 @@ as hv2 ovs-appctl netdev-dummy/receive vif_ext $garp
 # result: ok, hv2 is gateway chassis for down_link
 #
 ovn-nbctl lrp-set-gateway-chassis down_link hv2
-sleep 2
+check ovn-nbctl --wait=hv sync
+######!!!!! sleep 2
 
 sha=0200000000ee
 tha=000000000000
@@ -43638,8 +43635,9 @@ as hv2 ovs-appctl netdev-dummy/receive vif2 $garp
 # Annonce 192.168.1.113, 114 from vif1, vif2 in hv1, hv2
 # result: ok, vif1, vif2 are virtual ports, restrictions are not applied.
 #
-ovn-nbctl lsp-set-type down_ext l2gateway
-sleep 2
+ovn-nbctl --wait=hv lsp-set-type down_ext l2gateway
+  #####check ovn-nbctl --wait=hv sync
+######!!!!! sleep 2
 
 sha=f00000000001
 tha=ffffffffffff

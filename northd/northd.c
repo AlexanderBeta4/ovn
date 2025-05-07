@@ -9664,7 +9664,7 @@ build_lswitch_arp_chassis_resident(struct lflow_table *lflows,
 
         if (lsp_is_localnet(nbsp) || lsp_is_l2gw(nbsp)) {
             ds_clear(&match);
-            ds_put_format(&match, "arp && inport == \"%s\"", nbsp->name);
+            ds_put_format(&match, "arp.op && inport == \"%s\"", nbsp->name);
             ovn_lflow_add(lflows, od, S_SWITCH_IN_CHECK_PORT_SEC, 75,
                           ds_cstr(&match), REGBIT_EXT_ARP" = 1; next;",
                           lflow_ref);
