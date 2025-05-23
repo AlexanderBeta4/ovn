@@ -56,6 +56,15 @@ VLOG_DEFINE_THIS_MODULE(nbctl);
  * change the database at all? */
 static bool force_wait = false;
 
+static char *
+string_ptr(char *ptr)
+{
+    static char *s = "";
+
+    return (ptr) ? ptr : s;
+}
+
+
 static void
 nbctl_add_base_prerequisites(struct ovsdb_idl *idl,
                              enum nbctl_wait_type wait_type)
@@ -290,9 +299,10 @@ QoS commands:\n\
   qos-list SWITCH           print QoS rules for SWITCH\n\
 \n\
 Mirror commands:\n\
-  mirror-add NAME TYPE [INDEX] FILTER {IP | MIRROR-ID} \n\
+  mirror-add NAME TYPE [INDEX] FILTER {IP | MIRROR-ID| TARGET-PORT} \n\
                             add a mirror with given name\n\
-                            specify TYPE 'gre', 'erspan', or 'local'\n\
+                            specify TYPE 'gre', 'erspan', 'local'\n\
+                                or 'lport'.\n\
                             specify the tunnel INDEX value\n\
                                 (indicates key if GRE\n\
                                  erpsan_idx if ERSPAN)\n\
@@ -301,8 +311,16 @@ Mirror commands:\n\
                             specify Sink / Destination i.e. Remote IP, or a\n\
                                 local interface with external-ids:mirror-id\n\
                                 matching MIRROR-ID\n\
+                                In case of lport type specify logical switch\n\
+                                port, which is a mirror target.\n\
   mirror-del [NAME]         remove mirrors\n\
   mirror-list               print mirrors\n\
+  mirror-rule-add MIRROR-NAME PRIORITY MATCH ACTION \n\
+                            add a mirror rule selection to given lport\n\
+                            mirror.\n\
+                            specify MATCH for selecting mirrored traffic.\n\
+                            specify ACTION 'mirror' or 'skip'.\n\
+  mirror-rule-del MIRROR-NAME [PRIORITY | MATCH] remove mirrors\n\
 \n\
 Meter commands:\n\
   [--fair]\n\
@@ -1798,11 +1816,11 @@ nbctl_lsp_attach_mirror(struct ctl_context *ctx)
         return;
     }
 
+    bool may_exist = shash_find(&ctx->options, "--may-exist") != NULL;
     /* Check if same mirror rule already exists for the lsp */
     for (size_t i = 0; i < lsp->n_mirror_rules; i++) {
         if (uuid_equals(&lsp->mirror_rules[i]->header_.uuid,
                         &mirror->header_.uuid)) {
-            bool may_exist = shash_find(&ctx->options, "--may-exist") != NULL;
             if (!may_exist) {
                 ctl_error(ctx, "mirror %s is already attached to the "
                           "logical port %s.",
@@ -4051,6 +4069,8 @@ nbctl_pre_lr_policy_add(struct ctl_context *ctx)
 
     ovsdb_idl_add_column(ctx->idl, &nbrec_bfd_col_dst_ip);
     ovsdb_idl_add_column(ctx->idl, &nbrec_bfd_col_logical_port);
+
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_chain);
 }
 
 static void
@@ -4071,13 +4091,16 @@ nbctl_lr_policy_add(struct ctl_context *ctx)
     const char *action = ctx->argv[4];
     size_t n_nexthops = 0;
     char **nexthops = NULL;
+    char *chain_s = shash_find_data(&ctx->options, "--chain");
 
     bool reroute = false;
+    bool jump = false;
+
     /* Validate action. */
     if (strcmp(action, "allow") && strcmp(action, "drop")
-        && strcmp(action, "reroute")) {
+        && strcmp(action, "jump") && strcmp(action, "reroute")) {
         ctl_error(ctx, "%s: action must be one of \"allow\", \"drop\", "
-                  "and \"reroute\"", action);
+                  "\"reroute\", \"jump\"", action);
         return;
     }
     if (!strcmp(action, "reroute")) {
@@ -4088,14 +4111,31 @@ nbctl_lr_policy_add(struct ctl_context *ctx)
         reroute = true;
     }
 
+    if (!strcmp(action, "jump")) {
+        if (ctx->argc < 6) {
+            ctl_error(ctx, "Chain name is required when action is jump.");
+            return;
+        }
+        jump = true;
+    }
+
+    if (!strcmp(action, "jump")) {
+        if (ctx->argc < 6) {
+            ctl_error(ctx, "Chain name is required when action is jump.");
+            return;
+        }
+        jump = true;
+    }
+
     /* Check if same routing policy already exists.
      * A policy is uniquely identified by priority and match */
     bool may_exist = !!shash_find(&ctx->options, "--may-exist");
     size_t i;
     for (i = 0; i < lr->n_policies; i++) {
         const struct nbrec_logical_router_policy *policy = lr->policies[i];
-        if (policy->priority == priority &&
-            !strcmp(policy->match, ctx->argv[3])) {
+        if (policy->priority == priority
+            && !strcmp(policy->match, ctx->argv[3])
+            && !strcmp(string_ptr(policy->chain), string_ptr(chain_s))) {
             if (!may_exist) {
                 ctl_error(ctx, "Same routing policy already existed on the "
                           "logical router %s.", ctx->argv[1]);
@@ -4157,6 +4197,15 @@ nbctl_lr_policy_add(struct ctl_context *ctx)
     nbrec_logical_router_policy_set_priority(policy, priority);
     nbrec_logical_router_policy_set_match(policy, ctx->argv[3]);
     nbrec_logical_router_policy_set_action(policy, action);
+
+    if (chain_s) {
+        nbrec_logical_router_policy_set_chain(policy, chain_s);
+    }
+
+    if (jump) {
+        nbrec_logical_router_policy_set_jump_chain(policy, ctx->argv[5]);
+    }
+
     if (reroute) {
         nbrec_logical_router_policy_set_nexthops(
             policy, (const char **)nexthops, n_nexthops);
@@ -4164,7 +4213,7 @@ nbctl_lr_policy_add(struct ctl_context *ctx)
 
     /* Parse the options. */
     struct smap options = SMAP_INITIALIZER(&options);
-    for (i = reroute ? 6 : 5; i < ctx->argc; i++) {
+    for (i = (reroute || jump) ? 6 : 5; i < ctx->argc; i++) {
         char *key, *value;
         value = xstrdup(ctx->argv[i]);
         key = strsep(&value, "=");
@@ -4276,85 +4325,77 @@ nbctl_pre_lr_policy_del(struct ctl_context *ctx)
 
     ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_priority);
     ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_match);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_chain);
 }
+
 
 static void
 nbctl_lr_policy_del(struct ctl_context *ctx)
 {
     const struct nbrec_logical_router *lr;
-    int64_t priority = 0;
     char *error = lr_by_name_or_uuid(ctx, ctx->argv[1], true, &lr);
+
     if (error) {
         ctx->error = error;
         return;
     }
 
-    if (ctx->argc == 2) {
-        /* If a priority is not specified, delete all policies. */
+    const char *chain = string_ptr(shash_find_data(&ctx->options, "--chain"));
+
+    /* An uuid or priority either chain are not specified.
+       Delete all policies for lr */
+    if (ctx->argc == 2 && !*chain) {
         nbrec_logical_router_set_policies(lr, NULL, 0);
         return;
     }
 
-    const struct uuid *lr_policy_uuid = NULL;
+    int64_t priority = 0;
     struct uuid uuid_from_cmd;
-    if (uuid_from_string(&uuid_from_cmd, ctx->argv[2])) {
-        lr_policy_uuid = &uuid_from_cmd;
-    } else {
+
+    /* An uuid is specified, delete the policy with uuid only */
+    if (ctx->argc == 3 && uuid_from_string(&uuid_from_cmd, ctx->argv[2])) {
+        for (int i = 0; i < lr->n_policies; i++) {
+            if (uuid_equals(&uuid_from_cmd,
+                            &(lr->policies[i]->header_.uuid))) {
+                nbrec_logical_router_update_policies_delvalue(
+                lr, lr->policies[i]);
+                return;
+            }
+        }
+
+        if (!shash_find(&ctx->options, "--if-exists")) {
+            ctl_error(ctx, "Logical router policy uuid is not found.");
+        }
+        return;
+    }
+
+    if (ctx->argc >= 3) {
         error = parse_priority(ctx->argv[2], &priority);
         if (error) {
             ctx->error = error;
             return;
         }
     }
-    /* If uuid was specified, delete routing policy with the
-     * specified uuid. */
-    if (ctx->argc == 3) {
-        size_t i;
 
-        if (lr_policy_uuid) {
-            for (i = 0; i < lr->n_policies; i++) {
-                if (uuid_equals(lr_policy_uuid,
-                                &(lr->policies[i]->header_.uuid))) {
-                    nbrec_logical_router_update_policies_delvalue(
-                        lr, lr->policies[i]);
-                    break;
-                }
-            }
-            if (i == lr->n_policies) {
-                if (!shash_find(&ctx->options, "--if-exists")) {
-                    ctl_error(ctx, "Logical router policy uuid is not found.");
-                }
-                return;
-            }
+    char *match = (ctx->argc == 4) ? ctx->argv[3] : NULL;
 
-        /* If match is not specified, delete all routing policies with the
-         * specified priority. */
-        } else {
-            for (i = 0; i < lr->n_policies; i++) {
-                if (priority == lr->policies[i]->priority) {
-                    nbrec_logical_router_update_policies_delvalue(
-                        lr, lr->policies[i]);
-                }
-            }
-        }
-        return;
-    }
-
-    /* Delete policy that has the same priority and match string */
     for (int i = 0; i < lr->n_policies; i++) {
-        struct nbrec_logical_router_policy *routing_policy = lr->policies[i];
-        if (priority == routing_policy->priority &&
-            !strcmp(ctx->argv[3], routing_policy->match)) {
-            nbrec_logical_router_update_policies_delvalue(lr, routing_policy);
-            return;
+        struct nbrec_logical_router_policy *policy = lr->policies[i];
+
+        /* Delete policies selected by chain, priority (if set),
+           match (if set). Sure, at least one option is set here */
+        if ((!priority || priority == policy->priority)
+            && (!strcmp(chain, string_ptr(policy->chain)))
+            && (!match || !strcmp(match, policy->match))) {
+            nbrec_logical_router_update_policies_delvalue(lr, policy);
         }
     }
 }
-
- struct routing_policy {
+struct routing_policy {
     int priority;
     char *match;
     const struct nbrec_logical_router_policy *policy;
+    char *chain;
 };
 
 static int
@@ -4362,6 +4403,12 @@ routing_policy_cmp(const void *policy1_, const void *policy2_)
 {
     const struct routing_policy *policy1p = policy1_;
     const struct routing_policy *policy2p = policy2_;
+    int chain_match = strcmp(policy1p->chain, policy2p->chain);
+
+    if (chain_match) {
+        return chain_match;
+    }
+
     if (policy1p->priority != policy2p->priority) {
         return policy1p->priority > policy2p->priority ? -1 : 1;
     } else {
@@ -4373,24 +4420,25 @@ static void
 print_routing_policy(const struct nbrec_logical_router_policy *policy,
                      struct ds *s)
 {
-    if (policy->n_nexthops) {
-        ds_put_format(s, "%10"PRId64" %50s %15s", policy->priority,
-                      policy->match, policy->action);
-        for (int i = 0; i < policy->n_nexthops; i++) {
-            char *next_hop = normalize_prefix_str(policy->nexthops[i]);
-            ds_put_format(s, i ? ", %s" : " %25s", next_hop ? next_hop : "");
-            free(next_hop);
-        }
-    } else {
-        ds_put_format(s, "%10"PRId64" %50s %15s", policy->priority,
-                      policy->match, policy->action);
+    ds_put_format(s, "%10"PRId64" %50s %15s",
+                  policy->priority, policy->match, policy->action);
+
+    if (strcmp(policy->action, "jump") == 0
+        && policy->jump_chain && *policy->jump_chain) {
+        ds_put_format(s, " -> %s", policy->jump_chain);
+    }
+
+    for (int i = 0; i < policy->n_nexthops; i++) {
+        char *next_hop = normalize_prefix_str(policy->nexthops[i]);
+        ds_put_format(s, i ? ", %s" : " %25s", next_hop ? next_hop : "");
+        free(next_hop);
     }
 
     if (!smap_is_empty(&policy->options) || policy->n_bfd_sessions) {
-        ds_put_format(s, "%15s", "");
         if (policy->n_bfd_sessions) {
-            ds_put_cstr(s, "bfd,");
+            ds_put_cstr(s, "bfd");
         }
+        ds_put_format(s, "%15s", "");
         struct smap_node *node;
         SMAP_FOR_EACH (node, &policy->options) {
             ds_put_format(s, "%s=%s,", node->key, node->value);
@@ -4414,6 +4462,9 @@ nbctl_pre_lr_policy_list(struct ctl_context *ctx)
     ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_options);
     ovsdb_idl_add_column(ctx->idl,
                          &nbrec_logical_router_policy_col_bfd_sessions);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_router_policy_col_chain);
+    ovsdb_idl_add_column(ctx->idl,
+                         &nbrec_logical_router_policy_col_jump_chain);
 }
 
 static void
@@ -4433,6 +4484,7 @@ nbctl_lr_policy_list(struct ctl_context *ctx)
             = lr->policies[i];
         policies[n_policies].priority = policy->priority;
         policies[n_policies].match = policy->match;
+        policies[n_policies].chain = string_ptr(policy->chain);
         policies[n_policies].policy = policy;
         n_policies++;
     }
@@ -4440,9 +4492,31 @@ nbctl_lr_policy_list(struct ctl_context *ctx)
     if (n_policies) {
         ds_put_cstr(&ctx->output, "Routing Policies\n");
     }
+
+    /* Print chain headings only if there are non-default chains.
+       Otherwise print format will be fully backward compatible.
+       Note that at this point policies are sorted out by chain names too.
+    */
+    char *chain_current;
+    int  print_chain_head = (n_policies
+                             && policies[n_policies - 1].chain[0]);
+
     for (int i = 0; i < n_policies; i++) {
+        /* Print chain heading */
+        if (print_chain_head
+            && (i == 0
+                || strcmp(chain_current, policies[i].chain))) {
+            chain_current = policies[i].chain;
+            if (*chain_current) {
+                ds_put_format(&ctx->output, "\nChain %s:\n", chain_current);
+            } else {
+                ds_put_format(&ctx->output, "Chain <Default>:\n");
+            }
+        }
+
         print_routing_policy(policies[i].policy, &ctx->output);
     }
+
     free(policies);
 }
 
@@ -7614,16 +7688,18 @@ static char * OVS_WARN_UNUSED_RESULT
 parse_mirror_type(const char *arg, const char **type_p)
 {
     /* Validate type.  Only require the first letter. */
-    if (arg[0] == 'g') {
+    if (!strcmp(arg, "gre")) {
         *type_p = "gre";
-    } else if (arg[0] == 'e') {
+    } else if (!strcmp(arg, "erspan")) {
         *type_p = "erspan";
-    } else if (arg[0] == 'l') {
+    } else if (!strcmp(arg, "local")) {
         *type_p = "local";
+    } else if (!strcmp(arg, "lport")) {
+        *type_p = "lport";
     } else {
         *type_p = NULL;
         return xasprintf("%s: type must be \"gre\", "
-                         "\"erspan\", or \"local\"", arg);
+                         "\"erspan\", or \"local\" or \"lport\"", arg);
     }
     return NULL;
 }
@@ -7636,6 +7712,7 @@ nbctl_pre_mirror_add(struct ctl_context *ctx)
     ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_index);
     ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_sink);
     ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_type);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_logical_switch_port_col_name);
 }
 
 static void
@@ -7660,14 +7737,17 @@ nbctl_mirror_add(struct ctl_context *ctx)
         }
     }
 
-    /* Type - gre/erspan/local */
+    /* Type - gre/erspan/local/lport */
     error = parse_mirror_type(ctx->argv[pos++], &type);
     if (error) {
         ctx->error = error;
         return;
     }
 
-    if (strcmp(type, "local")) {
+    int is_local = !strcmp(type, "local");
+    int is_lport = !strcmp(type, "lport");
+
+    if (!is_local && !is_lport) {
         /* tunnel index / GRE key / ERSPAN idx */
         if (!str_to_long(ctx->argv[pos++], 10, (long int *) &index)) {
             ctl_error(ctx, "Invalid Index");
@@ -7686,7 +7766,7 @@ nbctl_mirror_add(struct ctl_context *ctx)
     sink = ctx->argv[pos++];
 
     /* check if it is a valid ip unless it is type 'local' */
-    if (strcmp(type, "local")) {
+    if (!is_local && !is_lport) {
         char *new_sink_ip = normalize_ipv4_addr_str(sink);
         if (!new_sink_ip) {
             new_sink_ip = normalize_ipv6_addr_str(sink);
@@ -7697,6 +7777,21 @@ nbctl_mirror_add(struct ctl_context *ctx)
             return;
         }
         free(new_sink_ip);
+    }
+
+    /* Check if it is an existing port for lport mirror type. */
+    if (is_lport) {
+        const struct nbrec_logical_switch_port *lsp;
+        error = lsp_by_name_or_uuid(ctx, sink, false, &lsp);
+        if (error) {
+            ctx->error = error;
+            return;
+        }
+
+        if (!lsp) {
+            VLOG_WARN("Attaching target to non existing port with name %s.",
+                      sink);
+        }
     }
 
     /* Create the mirror. */
@@ -7738,6 +7833,143 @@ nbctl_mirror_del(struct ctl_context *ctx)
     }
 }
 
+static int
+rule_cmp(const void *mirror1_, const void *mirror2_)
+{
+    const struct nbrec_mirror_rule *const *mirror_1 = mirror1_;
+    const struct nbrec_mirror_rule *const *mirror_2 = mirror2_;
+
+    const struct nbrec_mirror_rule *mirror1 = *mirror_1;
+    const struct nbrec_mirror_rule *mirror2 = *mirror_2;
+
+    int result =  mirror1->priority - mirror2->priority;
+    if (result) {
+        return result;
+    }
+
+    result = strcmp(mirror1->match, mirror2->match);
+    if (result) {
+        return result;
+    }
+
+    return strcmp(mirror1->action, mirror2->action);
+}
+
+static void
+nbctl_pre_mirror_rule_add(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_mirror_rules);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_rule_col_match);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_rule_col_action);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_rule_col_priority);
+}
+
+static void
+nbctl_mirror_rule_add(struct ctl_context *ctx)
+{
+    const struct nbrec_mirror_rule *mirror_rule;
+    const struct nbrec_mirror *mirror;
+    int64_t priority = 0;
+    char *error;
+
+    error = mirror_by_name_or_uuid(ctx, ctx->argv[1], true, &mirror);
+    if (error) {
+        ctx->error = error;
+        return;
+    }
+
+    error = parse_priority(ctx->argv[2], &priority);
+    if (error) {
+        ctx->error = error;
+        return;
+    }
+
+    const char *action = ctx->argv[4];
+    if (strcmp(action, "mirror") && strcmp(action, "skip")) {
+        ctl_error(ctx, "%s: action must be one of \"mirror\", \"skip\"",
+                  action);
+    }
+
+    mirror_rule = nbrec_mirror_rule_insert(ctx->txn);
+    nbrec_mirror_rule_set_match(mirror_rule, ctx->argv[3]);
+    nbrec_mirror_rule_set_action(mirror_rule, action);
+    nbrec_mirror_rule_set_priority(mirror_rule, priority);
+
+    bool may_exist = shash_find(&ctx->options, "--may-exist") != NULL;
+    /* Check if same mirror rule exists for this mirror. */
+    for (size_t i = 0; i < mirror->n_mirror_rules; i++) {
+        if (!rule_cmp(&mirror_rule, &mirror->mirror_rules[i])) {
+            if (!may_exist) {
+                ctl_error(ctx, "Same mirror-rule already exists on the "
+                          "mirror %s.", ctx->argv[1]);
+            } else {
+                nbrec_mirror_rule_delete(mirror_rule);
+            }
+            return;
+        }
+    }
+
+    /* Insert mirror rule to mirror. */
+    nbrec_mirror_update_mirror_rules_addvalue(mirror, mirror_rule);
+}
+
+static void
+nbctl_pre_mirror_rule_del(struct ctl_context *ctx)
+{
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_name);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_mirror_rules);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_rule_col_action);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_rule_col_priority);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_rule_col_match);
+}
+
+static void
+nbctl_mirror_rule_del(struct ctl_context *ctx)
+{
+    const struct nbrec_mirror *mirror = NULL;
+    int64_t priority = 0;
+    char *error = NULL;
+
+    error = mirror_by_name_or_uuid(ctx, ctx->argv[1], true, &mirror);
+    if (error) {
+        ctx->error = error;
+        return;
+    }
+
+    if (ctx->argc == 2) {
+        for (size_t i = 0; i < mirror->n_mirror_rules; i++) {
+            nbrec_mirror_update_mirror_rules_delvalue(mirror,
+                                    mirror->mirror_rules[i]);
+        }
+        return;
+    }
+
+    error = parse_priority(ctx->argv[2], &priority);
+    if (error) {
+        ctx->error = error;
+        return;
+    }
+
+    if (ctx->argc == 3) {
+        for (size_t i = 0; i < mirror->n_mirror_rules; i++) {
+            struct nbrec_mirror_rule *rule = mirror->mirror_rules[i];
+            if (priority == rule->priority) {
+                nbrec_mirror_update_mirror_rules_delvalue(mirror, rule);
+                return;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < mirror->n_mirror_rules; i++) {
+        struct nbrec_mirror_rule *rule = mirror->mirror_rules[i];
+        if (priority == rule->priority && !strcmp(ctx->argv[3],
+            rule->match)) {
+            nbrec_mirror_update_mirror_rules_delvalue(mirror, rule);
+        }
+    }
+}
+
 static void
 nbctl_pre_mirror_list(struct ctl_context *ctx)
 {
@@ -7747,6 +7979,10 @@ nbctl_pre_mirror_list(struct ctl_context *ctx)
     ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_index);
     ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_sink);
     ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_type);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_col_mirror_rules);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_rule_col_action);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_rule_col_match);
+    ovsdb_idl_add_column(ctx->idl, &nbrec_mirror_rule_col_priority);
 }
 
 static void
@@ -7773,13 +8009,37 @@ nbctl_mirror_list(struct ctl_context *ctx)
 
     for (size_t i = 0; i < n_mirrors; i++) {
         mirror = mirrors[i];
+        bool is_lport = !strcmp(mirror->type, "lport");
+        bool is_local = !strcmp(mirror->type, "local");
+
         ds_put_format(&ctx->output, "%s:\n", mirror->name);
         /* print all the values */
         ds_put_format(&ctx->output, "  Type     :  %s\n", mirror->type);
         ds_put_format(&ctx->output, "  Sink     :  %s\n", mirror->sink);
         ds_put_format(&ctx->output, "  Filter   :  %s\n", mirror->filter);
-        ds_put_format(&ctx->output, "  Index/Key:  %ld\n",
-                      (long int) mirror->index);
+        if (!is_local && !is_lport) {
+            ds_put_format(&ctx->output, "  Index/Key:  %"PRId64"\n",
+                          mirror->index);
+        }
+        if (mirror->n_mirror_rules) {
+            const struct nbrec_mirror_rule **mirror_rules  = NULL;
+            mirror_rules = xmalloc(sizeof *mirror_rules * mirror->n_mirror_rules);
+
+            for (size_t j = 0; j < mirror->n_mirror_rules; j++) {
+                mirror_rules[j] = mirror->mirror_rules[j];
+            }
+
+            qsort(mirror_rules, mirror->n_mirror_rules, sizeof *mirror_rules, rule_cmp);
+
+            ds_put_cstr(&ctx->output, "  Rules    :\n");
+            for (int j = 0; j < mirror->n_mirror_rules; j++) {
+                ds_put_format(&ctx->output, "       %5"PRId64" %30s %15s\n",
+                              mirror_rules[j]->priority,
+                              mirror_rules[j]->match,
+                              mirror_rules[j]->action);
+            }
+            free(mirror_rules);
+        }
         ds_put_cstr(&ctx->output, "\n");
     }
 
@@ -7884,12 +8144,18 @@ static const struct ctl_command_syntax nbctl_commands[] = {
 
     /* mirror commands. */
     { "mirror-add", 4, 5,
-      "NAME TYPE INDEX FILTER IP",
+      "NAME TYPE INDEX FILTER SINK",
       nbctl_pre_mirror_add, nbctl_mirror_add, NULL, "--may-exist", RW },
     { "mirror-del", 0, 1, "[NAME]",
       nbctl_pre_mirror_del, nbctl_mirror_del, NULL, "", RW },
     { "mirror-list", 0, 0, "", nbctl_pre_mirror_list, nbctl_mirror_list,
       NULL, "", RO },
+
+    /* Mirror rule commands. */
+    { "mirror-rule-add", 4, 4, "MIRROR-NAME PRIORITY MATCH ACTION",
+      nbctl_pre_mirror_rule_add, nbctl_mirror_rule_add, NULL, "", RW},
+    { "mirror-rule-del", 1, 3, "MIRROR-NAME [PRIORITY MATCH]",
+      nbctl_pre_mirror_rule_del, nbctl_mirror_rule_del, NULL, "", RW },
 
     /* meter commands. */
     { "meter-add", 4, 5, "NAME ACTION RATE UNIT [BURST]", nbctl_pre_meter_add,
@@ -8009,10 +8275,11 @@ static const struct ctl_command_syntax nbctl_commands[] = {
     /* Policy commands */
     { "lr-policy-add", 4, INT_MAX,
      "ROUTER PRIORITY MATCH ACTION [NEXTHOP] [OPTIONS - KEY=VALUE ...]",
-     nbctl_pre_lr_policy_add, nbctl_lr_policy_add, NULL, "--may-exist,--bfd?",
-     RW },
+     nbctl_pre_lr_policy_add, nbctl_lr_policy_add, NULL,
+     "--may-exist,--bfd?,--chain=", RW },
     { "lr-policy-del", 1, 3, "ROUTER [{PRIORITY | UUID} [MATCH]]",
-      nbctl_pre_lr_policy_del, nbctl_lr_policy_del, NULL, "--if-exists", RW },
+      nbctl_pre_lr_policy_del, nbctl_lr_policy_del, NULL,
+      "--if-exists,--chain=", RW },
     { "lr-policy-list", 1, 1, "ROUTER", nbctl_pre_lr_policy_list,
       nbctl_lr_policy_list, NULL, "", RO },
 

@@ -2167,6 +2167,10 @@ check_uuid ovn-nbctl -- --id=@nat create nat type="snat" logical_ip=192.168.2.2 
 
 # Wait for ovn-controller to catch up.
 check ovn-nbctl --wait=hv sync
+
+# Get the OF table numbers
+snat=$(ovn-debug lflow-stage-to-oftable lr_out_snat)
+
 OVS_WAIT_UNTIL([ovs-ofctl -O OpenFlow13 dump-groups br-int | \
 grep 'nat(dst=192.168.2.2:80)'])
 
@@ -2203,7 +2207,7 @@ tcp,orig=(src=172.16.1.2,dst=30.0.0.2,sport=<cleared>,dport=<cleared>),reply=(sr
 ])
 
 check_est_flows () {
-    n=$(ovs-ofctl dump-flows br-int table=13 | grep \
+    n=$(ovs-ofctl dump-flows br-int table=$(ovn-debug lflow-stage-to-oftable lr_in_defrag) | grep \
 "priority=100,tcp,metadata=0x2,nw_dst=30.0.0.2" | grep nat |
 sed -n 's/.*n_packets=\([[0-9]]\{1,\}\).*/\1/p')
 
@@ -2229,7 +2233,7 @@ check ovn-nbctl set load_balancer $uuid vips:'"30.0.0.2:8000"'='"192.168.1.2:80,
 
 ovn-nbctl list load_balancer
 ovn-sbctl dump-flows R2
-OVS_WAIT_UNTIL([ovs-ofctl -O OpenFlow13 dump-flows br-int table=45 | \
+OVS_WAIT_UNTIL([ovs-ofctl -O OpenFlow13 dump-flows br-int table=$snat | \
 grep 'nat(src=20.0.0.2)'])
 
 check ovs-appctl dpctl/flush-conntrack
@@ -2268,7 +2272,7 @@ check ovn-nbctl set load_balancer $uuid vips:'"30.0.0.2:8000"'='"192.168.1.2:80,
 
 ovn-nbctl list load_balancer
 ovn-sbctl dump-flows R2
-OVS_WAIT_UNTIL([ovs-ofctl -O OpenFlow13 dump-flows br-int table=45 | \
+OVS_WAIT_UNTIL([ovs-ofctl -O OpenFlow13 dump-flows br-int table=$snat | \
 grep 'nat(src=20.0.0.2)'])
 
 rm -f wget*.log
@@ -4933,10 +4937,113 @@ AT_CLEANUP
 ])
 
 OVN_FOR_EACH_NORTHD([
+AT_SETUP([Load Balancer LS hairpin IPv4 with stateless ACLs])
+
+ovn_start
+
+OVS_TRAFFIC_VSWITCHD_START()
+ADD_BR([br-int])
+
+# Set external-ids in br-int needed for ovn-controller
+ovs-vsctl \
+        -- set Open_vSwitch . external-ids:system-id=hv1 \
+        -- set Open_vSwitch . external-ids:ovn-remote=unix:$ovs_base/ovn-sb/ovn-sb.sock \
+        -- set Open_vSwitch . external-ids:ovn-encap-type=geneve \
+        -- set Open_vSwitch . external-ids:ovn-encap-ip=169.0.0.1 \
+        -- set bridge br-int fail-mode=secure other-config:disable-in-band=true
+
+# Start ovn-controller
+start_daemon ovn-controller
+
+# Logical network:
+# One logical switch with IPv4 load balancers that hairpin the traffic.
+check ovn-nbctl ls-add sw
+check ovn-nbctl lsp-add sw lsp -- lsp-set-addresses lsp 00:00:00:00:00:01
+check ovn-nbctl lb-add lb-ipv4-tcp 88.88.88.88:8080 42.42.42.1:4041 tcp
+check ovn-nbctl ls-lb-add sw lb-ipv4-tcp
+
+check ovn-nbctl lr-add rtr
+check ovn-nbctl lrp-add rtr rtr-sw 00:00:00:00:01:00 42.42.42.254/24
+check ovn-nbctl lsp-add sw sw-rtr                       \
+    -- lsp-set-type sw-rtr router                 \
+    -- lsp-set-addresses sw-rtr 00:00:00:00:01:00 \
+    -- lsp-set-options sw-rtr router-port=rtr-sw
+
+ADD_NAMESPACES(lsp)
+ADD_VETH(lsp, lsp, br-int, "42.42.42.1/24", "00:00:00:00:00:01", \
+         "42.42.42.254")
+
+check ovn-nbctl --wait=hv -t 3 sync
+
+# Start IPv4 TCP server on lsp.
+NETNS_DAEMONIZE([lsp], [nc -l -k 42.42.42.1 4041], [lsp0.pid])
+
+
+# Check that IPv4 TCP hairpin connection succeeds on VIP.
+NS_CHECK_EXEC([lsp], [nc 88.88.88.88 8080 -z], [0], [ignore], [ignore])
+
+check ovn-nbctl acl-add sw to-lport 2000 'ip' allow-stateless
+check ovn-nbctl acl-add sw from-lport 2000 'ip' allow-stateless
+
+NS_CHECK_EXEC([lsp], [timeout 10 nc -z 88.88.88.88 8080 || echo "Connection timed out after 10 seconds"], [0], [ignore], [ignore])
+
+# send syn
+# 42.42.42.1:y -> 88.88.88.88:8080
+# snat to lb vip
+# 88.88.88.88:x - 42.42.42.1:4041 syn (we pass this packet to conntrack in egress)
+# so we send syn + ack
+# 42.42.42.1:4041 -> 88.88.88.88:x (here we need fourth flow to pass this packet to conntrack)
+# snat to client ip
+# send syn + ack
+# 88.88.88.88:8080 -> 42.42.42.1:y (we pass this packet to conntrack in egress)
+# send ack
+# 42.42.42.1:y -> 88.88.88.88:8080 (this package matches the fourth flow)
+# snat to vip
+# send ack
+# 88.88.88.88:x - 42.42.42.1:4041 (here we need third flow to pass this packet to conntrack)
+AT_CHECK([ovn-sbctl lflow-list sw | grep ls_in_pre_stateful | sed 's/table=../table=??/' | sort], [0], [dnl
+  table=??(ls_in_pre_stateful ), priority=0    , match=(1), action=(next;)
+  table=??(ls_in_pre_stateful ), priority=100  , match=(reg0[[0]] == 1), action=(ct_next;)
+  table=??(ls_in_pre_stateful ), priority=105  , match=(tcp && ip4.dst == 88.88.88.88), action=(ct_lb_mark;)
+  table=??(ls_in_pre_stateful ), priority=110  , match=(reg0[[2]] == 1), action=(ct_lb_mark;)
+  table=??(ls_in_pre_stateful ), priority=115  , match=(reg0[[2]] == 1 && ip.is_frag), action=(reg0[[19]] = 1; ct_lb_mark;)
+  table=??(ls_in_pre_stateful ), priority=120  , match=(ip4.dst == 88.88.88.88 && tcp.dst == 8080), action=(reg1 = 88.88.88.88; reg2[[0..15]] = 8080; ct_lb_mark;)
+])
+
+check ovn-nbctl set load_balancer lb-ipv4-tcp options:hairpin_snat_ip="88.88.88.89"
+AT_CHECK([ovn-sbctl lflow-list sw | grep ls_in_pre_stateful | sed 's/table=../table=??/' | sort], [0], [dnl
+  table=??(ls_in_pre_stateful ), priority=0    , match=(1), action=(next;)
+  table=??(ls_in_pre_stateful ), priority=100  , match=(reg0[[0]] == 1), action=(ct_next;)
+  table=??(ls_in_pre_stateful ), priority=105  , match=(tcp && ip4.dst == 88.88.88.89), action=(ct_lb_mark;)
+  table=??(ls_in_pre_stateful ), priority=110  , match=(reg0[[2]] == 1), action=(ct_lb_mark;)
+  table=??(ls_in_pre_stateful ), priority=115  , match=(reg0[[2]] == 1 && ip.is_frag), action=(reg0[[19]] = 1; ct_lb_mark;)
+  table=??(ls_in_pre_stateful ), priority=120  , match=(ip4.dst == 88.88.88.88 && tcp.dst == 8080), action=(reg1 = 88.88.88.88; reg2[[0..15]] = 8080; ct_lb_mark;)
+])
+
+# Check that IPv4 TCP hairpin connection succeeds on VIP.
+NS_CHECK_EXEC([lsp], [nc 88.88.88.88 8080 -z], [0], [ignore], [ignore])
+
+OVN_CLEANUP_CONTROLLER([hv1])
+
+as ovn-sb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as ovn-nb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as northd
+OVS_APP_EXIT_AND_WAIT([ovn-northd])
+
+as
+OVS_TRAFFIC_VSWITCHD_STOP(["/failed to query port patch-.*/d
+/connection dropped.*/d"])
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
 AT_SETUP([Load Balancer LS hairpin IPv6])
 AT_SKIP_IF([test $HAVE_NC = no])
 AT_KEYWORDS([lb])
-
 ovn_start
 
 OVS_TRAFFIC_VSWITCHD_START()
@@ -5124,7 +5231,7 @@ OVS_WAIT_UNTIL([
 ])
 
 OVS_WAIT_UNTIL([
-    n_pkt=$(ovs-ofctl dump-flows br-int table=46 | grep -v n_packets=0 | \
+    n_pkt=$(ovs-ofctl dump-flows br-int table=$(ovn-debug lflow-stage-to-oftable ls_out_acl_eval) | grep -v n_packets=0 | \
 grep controller | grep tp_dst=84 -c)
     test $n_pkt -eq 1
 ])
@@ -5358,7 +5465,7 @@ OVS_WAIT_UNTIL([
 ])
 
 OVS_WAIT_UNTIL([
-    n_pkt=$(ovs-ofctl dump-flows br-int table=46 | grep -v n_packets=0 | \
+    n_pkt=$(ovs-ofctl dump-flows br-int table=$(ovn-debug lflow-stage-to-oftable ls_out_acl_eval) | grep -v n_packets=0 | \
 grep controller | grep tp_dst=84 -c)
     test $n_pkt -eq 1
 ])
@@ -6177,7 +6284,7 @@ tcp,orig=(src=172.16.0.1,dst=10.0.0.2,sport=<cleared>,dport=<cleared>),reply=(sr
 # Like with conntrack entries, we shouldn't try to predict
 # port binding tunnel keys. So omit them from expected labels.
 ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-est-rpl+trk).*ct(.*label=0x401020400000000/.*)'
-AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-est-rpl+trk).*ct(.*label=0x401020400000000/.*)' -c], [0], [dnl
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-rpl+trk).*ct(.*label=0x401020400000000/.*)' -c], [0], [dnl
 2
 ])
 AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(-new+est+rpl+trk).*ct_label(0x401020400000000)' -c], [0], [dnl
@@ -6199,7 +6306,7 @@ NS_CHECK_EXEC([bob1], [ping -q -c 3 -i 0.3 -w 2 10.0.0.2 | FORMAT_PING], \
 [0], [dnl
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
-AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-est-rpl+trk).*ct(.*label=0x1001020400000000/.*)' -c], [0], [dnl
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-rpl+trk).*ct(.*label=0x1001020400000000/.*)' -c], [0], [dnl
 2
 ])
 AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(-new+est+rpl+trk).*ct_label(0x1001020400000000)' -c], [0], [dnl
@@ -6232,7 +6339,7 @@ NS_CHECK_EXEC([bob1], [ping -q -c 3 -i 0.3 -w 2 10.0.0.2 | FORMAT_PING], \
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
 
-AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-est-rpl+trk).*ct(.*label=0x1001020400000000/.*)' -c], [0], [dnl
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-rpl+trk).*ct(.*label=0x1001020400000000/.*)' -c], [0], [dnl
 2
 ])
 AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(-new+est+rpl+trk).*ct_label(0x1001020400000000)' -c], [0], [dnl
@@ -6393,7 +6500,7 @@ NS_CHECK_EXEC([bob1], [ping -q -c 3 -i 0.3 -w 2 fd01::2 | FORMAT_PING], \
 # Ensure datapaths show conntrack states as expected
 # Like with conntrack entries, we shouldn't try to predict
 # port binding tunnel keys. So omit them from expected labels.
-AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-est-rpl+trk).*ct(.*label=0x401020400000000/.*)' -c], [0], [dnl
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-rpl+trk).*ct(.*label=0x401020400000000/.*)' -c], [0], [dnl
 2
 ])
 
@@ -6425,7 +6532,7 @@ NS_CHECK_EXEC([bob1], [ping -q -c 3 -i 0.3 -w 2 fd01::2 | FORMAT_PING], \
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
 
-AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-est-rpl+trk).*ct(.*label=0x1001020400000000/.*)' -c], [0], [dnl
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-rpl+trk).*ct(.*label=0x1001020400000000/.*)' -c], [0], [dnl
 2
 ])
 AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(-new+est+rpl+trk).*ct_label(0x1001020400000000)' -c], [0], [dnl
@@ -6459,7 +6566,7 @@ NS_CHECK_EXEC([bob1], [ping -q -c 3 -i 0.3 -w 2 fd01::2 | FORMAT_PING], \
 3 packets transmitted, 3 received, 0% packet loss, time 0ms
 ])
 
-AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-est-rpl+trk).*ct(.*label=0x1001020400000000/.*)' -c], [0], [dnl
+AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(+new-rpl+trk).*ct(.*label=0x1001020400000000/.*)' -c], [0], [dnl
 2
 ])
 AT_CHECK([ovs-appctl dpctl/dump-flows | grep 'ct_state(-new+est+rpl+trk).*ct_label(0x1001020400000000)' -c], [0], [dnl
@@ -8913,7 +9020,7 @@ ovn-sbctl list ip_multicast
 
 wait_igmp_flows_installed()
 {
-    OVS_WAIT_UNTIL([ovs-ofctl dump-flows br-int table=35 | \
+    OVS_WAIT_UNTIL([ovs-ofctl dump-flows br-int table=$(ovn-debug lflow-stage-to-oftable ls_in_l2_lkup) | \
     grep 'priority=90' | grep "nw_dst=$1"])
 }
 
@@ -9796,7 +9903,7 @@ tcp,orig=(src=192.168.1.2,dst=30.30.30.30,sport=<cleared>,dport=<cleared>),reply
 
 AT_CHECK([ovs-appctl dpctl/flush-conntrack])
 
-# remove lb
+# Remove Load Balancer.
 check ovn-nbctl ls-lb-del foo lb1
 
 # add stateless acl
@@ -9813,7 +9920,29 @@ sed -e 's/zone=[[0-9]]*/zone=<cleared>/'], [0], [dnl
 
 AT_CHECK([ovs-appctl dpctl/flush-conntrack])
 
-# add lb back
+# Delete ACLs.
+check ovn-nbctl acl-del foo
+
+# Add stateful ACLs.
+check ovn-nbctl acl-add foo from-lport 1 1 allow-related
+check ovn-nbctl --wait=hv acl-add foo to-lport 1 1 allow-related
+
+# Add stateless ACLs.
+check ovn-nbctl acl-add foo from-lport 2 1 allow-stateless
+check ovn-nbctl --wait=hv acl-add foo to-lport 2 1 allow-stateless
+
+AT_CHECK([ip netns exec foo1 wget   192.168.2.2 -t 1 -T 1], [0], [ignore], [ignore])
+
+# Check conntrack zone has no entry.
+AT_CHECK([ovs-appctl dpctl/dump-conntrack zone=$zone_id | \
+FORMAT_CT(192.168.2.2) | \
+sed -e 's/zone=[[0-9]]*/zone=<cleared>/'], [0], [dnl
+])
+
+AT_CHECK([ovs-appctl dpctl/flush-conntrack])
+
+# When lb configured: pass conntrack for vip traffic.
+# Add Load Balancer back.
 check ovn-nbctl ls-lb-add foo lb1
 
 # Wait for ovn-controller to catch up.
@@ -9822,13 +9951,14 @@ check ovn-nbctl --wait=hv sync
 OVS_WAIT_UNTIL([ovs-ofctl -O OpenFlow13 dump-groups br-int | \
 grep 'nat(dst=192.168.2.2:80)'])
 
-# should not dnat so will not be able to connect
-AT_CHECK([ip netns exec foo1 wget   30.30.30.30  -t 3 -T 1], [4], [ignore], [ignore])
+# Now check with VIP.
+AT_CHECK([ip netns exec foo1 wget   30.30.30.30  -t 3 -T 1], [0], [ignore], [ignore])
 
-# check conntrack zone has no tcp entry
+# Check conntrack zone has tcp entry.
 AT_CHECK([ovs-appctl dpctl/dump-conntrack zone=$zone_id | \
 FORMAT_CT(30.30.30.30) | \
 sed -e 's/zone=[[0-9]]*/zone=<cleared>/'], [0], [dnl
+tcp,orig=(src=192.168.1.2,dst=30.30.30.30,sport=<cleared>,dport=<cleared>),reply=(src=192.168.2.2,dst=192.168.1.2,sport=<cleared>,dport=<cleared>),zone=<cleared>,mark=2,protoinfo=(state=<cleared>)
 ])
 
 AT_CHECK([ovs-appctl dpctl/flush-conntrack])
@@ -9929,7 +10059,7 @@ tcp,orig=(src=fd11::2,dst=fd12::2,sport=<cleared>,dport=<cleared>),reply=(src=fd
 
 AT_CHECK([ovs-appctl dpctl/flush-conntrack])
 
-# now check with VIP
+# Now check with VIP.
 AT_CHECK([ip netns exec foo1 wget  http://[[fd30::2]]  -t 3 -T 1], [0], [ignore], [ignore])
 
 # check conntrack zone has tcp entry
@@ -9941,16 +10071,23 @@ tcp,orig=(src=fd11::2,dst=fd30::2,sport=<cleared>,dport=<cleared>),reply=(src=fd
 
 AT_CHECK([ovs-appctl dpctl/flush-conntrack])
 
-# remove lb
+# Remove Load_Balancer.
 check ovn-nbctl ls-lb-del foo lb1
 
-# add stateless acl
-check ovn-nbctl acl-add foo from-lport 1 1 allow-stateless
-check ovn-nbctl --wait=hv acl-add foo to-lport 1 1 allow-stateless
+# Delete ACLs.
+check ovn-nbctl acl-del foo
 
-AT_CHECK([ip netns exec foo1  wget http://[[fd12::2]] -t 3 -T 1], [0], [ignore], [ignore])
+# Add stateful ACLs.
+check ovn-nbctl acl-add foo from-lport 1 1 allow-related
+check ovn-nbctl --wait=hv acl-add foo to-lport 1 1 allow-related
 
-# check conntrack zone has no tcp entry
+# Add stateless ACLs.
+check ovn-nbctl acl-add foo from-lport 2 1 allow-stateless
+check ovn-nbctl --wait=hv acl-add foo to-lport 2 1 allow-stateless
+
+AT_CHECK([ip netns exec foo1  wget http://[[fd12::2]] -t 1 -T 1], [0], [ignore], [ignore])
+
+# Check conntrack zone has no tcp entry.
 AT_CHECK([ovs-appctl dpctl/dump-conntrack zone=$zone_id | \
 FORMAT_CT(fd12::2) |  grep -v fe80 | \
 sed -e 's/zone=[[0-9]]*/zone=<cleared>/'], [0], [dnl
@@ -9958,7 +10095,23 @@ sed -e 's/zone=[[0-9]]*/zone=<cleared>/'], [0], [dnl
 
 AT_CHECK([ovs-appctl dpctl/flush-conntrack])
 
-# add lb back
+check ovn-nbctl acl-del foo
+
+# Add stateless ACLs.
+check ovn-nbctl acl-add foo from-lport 1 1 allow-stateless
+check ovn-nbctl --wait=hv acl-add foo to-lport 1 1 allow-stateless
+
+AT_CHECK([ip netns exec foo1  wget http://[[fd12::2]] -t 3 -T 1], [0], [ignore], [ignore])
+
+# Check conntrack zone has no tcp entry.
+AT_CHECK([ovs-appctl dpctl/dump-conntrack zone=$zone_id | \
+FORMAT_CT(fd12::2) |  grep -v fe80 | \
+sed -e 's/zone=[[0-9]]*/zone=<cleared>/'], [0], [dnl
+])
+
+AT_CHECK([ovs-appctl dpctl/flush-conntrack])
+
+# Add Load Balancer back.
 check ovn-nbctl ls-lb-add foo lb1
 
 # Wait for ovn-controller to catch up.
@@ -9967,13 +10120,14 @@ check ovn-nbctl --wait=hv sync
 OVS_WAIT_UNTIL([ovs-ofctl -O OpenFlow13 dump-groups br-int | \
 grep 'nat(dst=\[[fd12::2\]]:80)'])
 
-# should not dnat so will not be able to connect
-AT_CHECK([ip netns exec foo1 wget  http://[[fd30::2]]  -t 3 -T 1], [4], [ignore], [ignore])
-#
-# check conntrack zone has no tcp entry
+# Now check with VIP.
+AT_CHECK([ip netns exec foo1 wget  http://[[fd30::2]]  -t 3 -T 1], [0], [ignore], [ignore])
+
+# Check conntrack zone has tcp entry.
 AT_CHECK([ovs-appctl dpctl/dump-conntrack zone=$zone_id | \
 FORMAT_CT(fd30::2) | grep -v fe80 | \
 sed -e 's/zone=[[0-9]]*/zone=<cleared>/'], [0], [dnl
+tcp,orig=(src=fd11::2,dst=fd30::2,sport=<cleared>,dport=<cleared>),reply=(src=fd12::2,dst=fd11::2,sport=<cleared>,dport=<cleared>),zone=<cleared>,mark=2,protoinfo=(state=<cleared>)
 ])
 
 AT_CHECK([ovs-appctl dpctl/flush-conntrack])
@@ -12142,7 +12296,7 @@ sctp,orig=(src=172.16.1.2,dst=30.0.0.2,sport=<cleared>,dport=<cleared>),reply=(s
 ])
 
 check_est_flows () {
-    n=$(ovs-ofctl dump-flows br-int table=15 | grep "+est" \
+    n=$(ovs-ofctl dump-flows br-int table=$(ovn-debug lflow-stage-to-oftable lr_in_dnat) | grep "+est" \
         | grep "ct_mark=$1" | sed -n 's/.*n_packets=\([[0-9]]\{1,\}\).*/\1/p')
 
     echo "n_packets=$n"
@@ -12168,7 +12322,7 @@ check ovn-nbctl set load_balancer $uuid vips:'"30.0.0.2:8000"'='"192.168.1.2:123
 
 ovn-nbctl list load_balancer
 ovn-sbctl dump-flows R2
-OVS_WAIT_UNTIL([ovs-ofctl -O OpenFlow13 dump-flows br-int table=45 | grep 'nat(src=20.0.0.2)'])
+OVS_WAIT_UNTIL([ovs-ofctl -O OpenFlow13 dump-flows br-int table=$(ovn-debug lflow-stage-to-oftable lr_out_snat) | grep 'nat(src=20.0.0.2)'])
 
 dnl Test load-balancing that includes L4 ports in NAT.
 for i in `seq 1 20`; do
@@ -13247,5 +13401,304 @@ as
 OVS_TRAFFIC_VSWITCHD_STOP(["/failed to query port patch-.*/d
 /connection dropped.*/d"])
 
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([Routing protocol redirect - l3 gateway])
+AT_SKIP_IF([test $HAVE_NC = no])
+
+ovn_start
+OVS_TRAFFIC_VSWITCHD_START()
+
+ADD_BR([br-int])
+ADD_BR([br-ext])
+
+check ovs-ofctl add-flow br-ext action=normal
+# Set external-ids in br-int needed for ovn-controller
+check ovs-vsctl \
+        -- set Open_vSwitch . external-ids:system-id=hv1 \
+        -- set Open_vSwitch . external-ids:ovn-remote=unix:$ovs_base/ovn-sb/ovn-sb.sock \
+        -- set Open_vSwitch . external-ids:ovn-encap-type=geneve \
+        -- set Open_vSwitch . external-ids:ovn-encap-ip=169.0.0.1 \
+        -- set bridge br-int fail-mode=secure other-config:disable-in-band=true
+
+# Start ovn-controller
+start_daemon ovn-controller
+
+check ovn-nbctl lr-add R1 \
+    -- set Logical_Router R1 options:chassis=hv1
+
+check ovn-nbctl ls-add public
+check ovn-nbctl ls-add bar
+
+check ovn-nbctl lrp-add R1 rp-public 00:00:02:01:02:03 172.16.1.1/24
+check ovn-nbctl lrp-add R1 rp-bar 00:00:ff:00:00:01 192.168.10.1/24
+
+check ovn-nbctl lsp-add public public-rp -- set Logical_Switch_Port public-rp \
+    type=router options:router-port=rp-public \
+    -- lsp-set-addresses public-rp router
+
+check ovn-nbctl lsp-add bar bar-rp -- set Logical_Switch_Port bar-rp \
+    type=router options:router-port=rp-bar \
+    -- lsp-set-addresses bar-rp router
+
+check ovn-nbctl lsp-add public bgp-daemon \
+    -- lsp-set-addresses bgp-daemon unknown
+
+# Setup container "bar1" representing host on an internal network
+ADD_NAMESPACES(bar1)
+ADD_VETH(bar1, bar1, br-int, "192.168.10.2/24", "00:00:ff:ff:ff:01", \
+         "192.168.10.1")
+check ovn-nbctl lsp-add bar bar1 \
+    -- lsp-set-addresses bar1 "00:00:ff:ff:ff:01 192.168.10.2"
+
+# Setup SNAT for the internal host
+check ovn-nbctl lr-nat-add R1 snat 172.16.1.1 192.168.10.2
+
+# Configure external connectivity
+check ovs-vsctl set Open_vSwitch . external-ids:ovn-bridge-mappings=phynet:br-ext
+check ovn-nbctl lsp-add public public1 \
+        -- lsp-set-addresses public1 unknown \
+        -- lsp-set-type public1 localnet \
+        -- lsp-set-options public1 network_name=phynet
+
+check ovn-nbctl --wait=hv sync
+
+# Set option that redirects BGP and BFD traffic to a LSP "bgp-daemon"
+check ovn-nbctl --wait=sb set logical_router_port rp-public options:routing-protocol-redirect=bgp-daemon
+check ovn-nbctl --wait=sb set logical_router_port rp-public options:routing-protocols=BGP,BFD
+
+# Create "bgp-daemon" interface in a namespace with IP and MAC matching LRP "rp-public"
+ADD_NAMESPACES(bgp-daemon)
+ADD_VETH(bgp-daemon, bgp-daemon, br-int, "172.16.1.1/24", "00:00:02:01:02:03")
+
+ADD_NAMESPACES(ext-foo)
+ADD_VETH(ext-foo, ext-foo, br-ext, "172.16.1.100/24", "00:10:10:01:02:13", \
+         "172.16.1.1")
+
+# Flip the interface down/up to get proper IPv6 LLA
+NS_EXEC([bgp-daemon], [ip link set down bgp-daemon])
+NS_EXEC([bgp-daemon], [ip link set up bgp-daemon])
+NS_EXEC([ext-foo], [ip link set down ext-foo])
+NS_EXEC([ext-foo], [ip link set up ext-foo])
+
+# Wait until IPv6 LLA loses the "tentative" flag otherwise it can't be bound to.
+OVS_WAIT_UNTIL([NS_EXEC([bgp-daemon], [ip a show dev bgp-daemon | grep "fe80::" | grep -v tentative])])
+OVS_WAIT_UNTIL([NS_EXEC([ext-foo], [ip a show dev ext-foo | grep "fe80::" | grep -v tentative])])
+
+# Verify that BGP control plane traffic is delivered to the "bgp-daemon"
+# interface on both IPv4 and IPv6 LLA addresses
+NETNS_DAEMONIZE([bgp-daemon], [nc -l -k 172.16.1.1 179], [bgp_v4.pid])
+NS_CHECK_EXEC([ext-foo], [echo "BGP IPv4 server traffic" | nc --send-only 172.16.1.1 179])
+
+NETNS_DAEMONIZE([bgp-daemon], [nc -l -6 -k fe80::200:2ff:fe01:203%bgp-daemon 179], [bgp_v6.pid])
+NS_CHECK_EXEC([ext-foo], [echo "BGP IPv6 server traffic" | nc --send-only -6 fe80::200:2ff:fe01:203%ext-foo 179])
+
+# Perform same set of checks as above for BFD daemon.
+# We need to manually check that the message arrived on the receiving end as Ncat will
+# produce false positive results over UDP due to lack of ICMP port unreachable messages
+# from LRP's IP.
+NETNS_DAEMONIZE([bgp-daemon], [nc -l -u 172.16.1.1 3784 > bgp-daemon_bfd_v4.out], [bfd_v4.pid])
+NS_CHECK_EXEC([ext-foo], [echo "from ext-foo: BFD IPv4 server traffic" | nc -u 172.16.1.1 3784])
+AT_CHECK([cat bgp-daemon_bfd_v4.out], [0], [dnl
+from ext-foo: BFD IPv4 server traffic
+])
+
+NETNS_DAEMONIZE([bgp-daemon], [nc -l -6 -u fe80::200:2ff:fe01:203%bgp-daemon 3784 > bgp-daemon_bfd_v6.out], [bfd_v6.pid])
+NS_CHECK_EXEC([ext-foo], [echo "from ext-foo: BFD IPv6 server traffic" | nc -u -6 fe80::200:2ff:fe01:203%ext-foo 3784])
+AT_CHECK([cat bgp-daemon_bfd_v6.out], [0], [dnl
+from ext-foo: BFD IPv6 server traffic
+])
+
+# Verify connection in other direction. i.e when BGP daemon running on "bgp-daemon" port
+# makes a client connection to its peer
+NETNS_DAEMONIZE([ext-foo], [nc -l -k 172.16.1.100 179], [reply_bgp_v4.pid])
+NS_CHECK_EXEC([bgp-daemon], [echo "BGP IPv4 client traffic" | nc --send-only 172.16.1.100 179])
+
+NETNS_DAEMONIZE([ext-foo], [nc -l -6 -k fe80::210:10ff:fe01:213%ext-foo 179], [reply_bgp_v6.pid])
+NS_CHECK_EXEC([bgp-daemon], [echo "BGP IPv6 client traffic" | nc --send-only -6 fe80::210:10ff:fe01:213%bgp-daemon 179])
+
+# Perform same checks in other direction for BFD daemon
+NETNS_DAEMONIZE([ext-foo], [nc -l -u 172.16.1.100 3784 > ext-foo_bfd_v4.out], [reply_bfd_v4.pid])
+NS_CHECK_EXEC([bgp-daemon], [echo "from bgp-daemon: BFD IPv4 client traffic" | nc -u 172.16.1.100 3784])
+AT_CHECK([cat ext-foo_bfd_v4.out], [0], [dnl
+from bgp-daemon: BFD IPv4 client traffic
+])
+
+NETNS_DAEMONIZE([ext-foo], [nc -l -6 -u fe80::210:10ff:fe01:213%ext-foo 3784 > ext-foo_bfd_v6.out], [reply_bfd_v6.pid])
+NS_CHECK_EXEC([bgp-daemon], [echo "from bgp-daemon: BFD IPv6 client traffic" | nc -u -6 fe80::210:10ff:fe01:213%bgp-daemon 3784])
+AT_CHECK([cat ext-foo_bfd_v6.out], [0], [dnl
+from bgp-daemon: BFD IPv6 client traffic
+])
+
+# Verify that hosts on the internal network can reach external networks
+NETNS_DAEMONIZE([ext-foo], [nc -l -k 172.16.1.100 2222], [nc_external.pid])
+NS_CHECK_EXEC([bar1], [echo "TCP test" | nc -w 1 --send-only 172.16.1.100 2222])
+
+OVS_APP_EXIT_AND_WAIT([ovn-controller])
+
+as ovn-sb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as ovn-nb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as northd
+OVS_APP_EXIT_AND_WAIT([ovn-northd])
+
+as
+OVS_TRAFFIC_VSWITCHD_STOP(["/.*error receiving.*/d
+/.*terminating with signal 15.*/d"])
+AT_CLEANUP
+])
+
+OVN_FOR_EACH_NORTHD([
+AT_SETUP([Routing protocol redirect - DGP])
+AT_SKIP_IF([test $HAVE_NC = no])
+
+ovn_start
+OVS_TRAFFIC_VSWITCHD_START()
+
+ADD_BR([br-int])
+ADD_BR([br-ext])
+
+check ovs-ofctl add-flow br-ext action=normal
+# Set external-ids in br-int needed for ovn-controller
+check ovs-vsctl \
+        -- set Open_vSwitch . external-ids:system-id=hv1 \
+        -- set Open_vSwitch . external-ids:ovn-remote=unix:$ovs_base/ovn-sb/ovn-sb.sock \
+        -- set Open_vSwitch . external-ids:ovn-encap-type=geneve \
+        -- set Open_vSwitch . external-ids:ovn-encap-ip=169.0.0.1 \
+        -- set bridge br-int fail-mode=secure other-config:disable-in-band=true
+
+# Start ovn-controller
+start_daemon ovn-controller
+
+check ovn-nbctl lr-add R1
+
+check ovn-nbctl ls-add public
+check ovn-nbctl ls-add bar
+
+check ovn-nbctl lrp-add R1 rp-public 00:00:02:01:02:03 172.16.1.1/24
+check ovn-nbctl lrp-add R1 rp-bar 00:00:ff:00:00:01 192.168.10.1/24
+
+check ovn-nbctl lsp-add public public-rp -- set Logical_Switch_Port public-rp \
+    type=router options:router-port=rp-public \
+    -- lsp-set-addresses public-rp router
+
+check ovn-nbctl lsp-add bar bar-rp -- set Logical_Switch_Port bar-rp \
+    type=router options:router-port=rp-bar \
+    -- lsp-set-addresses bar-rp router
+
+check ovn-nbctl lsp-add public bgp-daemon \
+    -- lsp-set-addresses bgp-daemon unknown
+
+check ovn-nbctl lrp-set-gateway-chassis rp-public hv1
+
+# Setup container "bar1" representing host on an internal network
+ADD_NAMESPACES(bar1)
+ADD_VETH(bar1, bar1, br-int, "192.168.10.2/24", "00:00:ff:ff:ff:01", \
+         "192.168.10.1")
+check ovn-nbctl lsp-add bar bar1 \
+    -- lsp-set-addresses bar1 "00:00:ff:ff:ff:01 192.168.10.2"
+
+# Setup SNAT for the internal host
+check ovn-nbctl lr-nat-add R1 snat 172.16.1.1 192.168.10.2
+
+# Configure external connectivity
+check ovs-vsctl set Open_vSwitch . external-ids:ovn-bridge-mappings=phynet:br-ext
+check ovn-nbctl lsp-add public public1 \
+        -- lsp-set-addresses public1 unknown \
+        -- lsp-set-type public1 localnet \
+        -- lsp-set-options public1 network_name=phynet
+
+check ovn-nbctl --wait=hv sync
+
+# Set option that redirects BGP and BFD traffic to a LSP "bgp-daemon"
+check ovn-nbctl --wait=sb set logical_router_port rp-public options:routing-protocol-redirect=bgp-daemon
+check ovn-nbctl --wait=sb set logical_router_port rp-public options:routing-protocols=BGP,BFD
+
+# Create "bgp-daemon" interface in a namespace with IP and MAC matching LRP "rp-public"
+ADD_NAMESPACES(bgp-daemon)
+ADD_VETH(bgp-daemon, bgp-daemon, br-int, "172.16.1.1/24", "00:00:02:01:02:03")
+
+ADD_NAMESPACES(ext-foo)
+ADD_VETH(ext-foo, ext-foo, br-ext, "172.16.1.100/24", "00:10:10:01:02:13", \
+         "172.16.1.1")
+
+# Flip the interface down/up to get proper IPv6 LLA
+NS_EXEC([bgp-daemon], [ip link set down bgp-daemon])
+NS_EXEC([bgp-daemon], [ip link set up bgp-daemon])
+NS_EXEC([ext-foo], [ip link set down ext-foo])
+NS_EXEC([ext-foo], [ip link set up ext-foo])
+
+# Wait until IPv6 LLA loses the "tentative" flag otherwise it can't be bound to.
+OVS_WAIT_UNTIL([NS_EXEC([bgp-daemon], [ip a show dev bgp-daemon | grep "fe80::" | grep -v tentative])])
+OVS_WAIT_UNTIL([NS_EXEC([ext-foo], [ip a show dev ext-foo | grep "fe80::" | grep -v tentative])])
+
+# Verify that BGP control plane traffic is delivered to the "bgp-daemon"
+# interface on both IPv4 and IPv6 LLA addresses
+NETNS_DAEMONIZE([bgp-daemon], [nc -l -k 172.16.1.1 179], [bgp_v4.pid])
+NS_CHECK_EXEC([ext-foo], [echo "BGP IPv4 server traffic" | nc --send-only 172.16.1.1 179])
+
+NETNS_DAEMONIZE([bgp-daemon], [nc -l -6 -k fe80::200:2ff:fe01:203%bgp-daemon 179], [bgp_v6.pid])
+NS_CHECK_EXEC([ext-foo], [echo "BGP IPv6 server traffic" | nc --send-only -6 fe80::200:2ff:fe01:203%ext-foo 179])
+
+# Perform same set of checks as above for BFD daemon.
+# We need to manually check that the message arrived on the receiving end as Ncat will
+# produce false positive results over UDP due to lack of ICMP port unreachable messages
+# from LRP's IP.
+NETNS_DAEMONIZE([bgp-daemon], [nc -l -u 172.16.1.1 3784 > bgp-daemon_bfd_v4.out], [bfd_v4.pid])
+NS_CHECK_EXEC([ext-foo], [echo "from ext-foo: BFD IPv4 server traffic" | nc -u 172.16.1.1 3784])
+AT_CHECK([cat bgp-daemon_bfd_v4.out], [0], [dnl
+from ext-foo: BFD IPv4 server traffic
+])
+
+NETNS_DAEMONIZE([bgp-daemon], [nc -l -6 -u fe80::200:2ff:fe01:203%bgp-daemon 3784 > bgp-daemon_bfd_v6.out], [bfd_v6.pid])
+NS_CHECK_EXEC([ext-foo], [echo "from ext-foo: BFD IPv6 server traffic" | nc -u -6 fe80::200:2ff:fe01:203%ext-foo 3784])
+AT_CHECK([cat bgp-daemon_bfd_v6.out], [0], [dnl
+from ext-foo: BFD IPv6 server traffic
+])
+
+# Verify connection in other direction. i.e when BGP daemon running on "bgp-daemon" port
+# makes a client connection to its peer
+NETNS_DAEMONIZE([ext-foo], [nc -l -k 172.16.1.100 179], [reply_bgp_v4.pid])
+NS_CHECK_EXEC([bgp-daemon], [echo "BGP IPv4 client traffic" | nc --send-only 172.16.1.100 179])
+
+NETNS_DAEMONIZE([ext-foo], [nc -l -6 -k fe80::210:10ff:fe01:213%ext-foo 179], [reply_bgp_v6.pid])
+NS_CHECK_EXEC([bgp-daemon], [echo "BGP IPv6 client traffic" | nc --send-only -6 fe80::210:10ff:fe01:213%bgp-daemon 179])
+
+# Perform same checks in other direction for BFD daemon
+NETNS_DAEMONIZE([ext-foo], [nc -l -u 172.16.1.100 3784 > ext-foo_bfd_v4.out], [reply_bfd_v4.pid])
+NS_CHECK_EXEC([bgp-daemon], [echo "from bgp-daemon: BFD IPv4 client traffic" | nc -u 172.16.1.100 3784])
+AT_CHECK([cat ext-foo_bfd_v4.out], [0], [dnl
+from bgp-daemon: BFD IPv4 client traffic
+])
+
+NETNS_DAEMONIZE([ext-foo], [nc -l -6 -u fe80::210:10ff:fe01:213%ext-foo 3784 > ext-foo_bfd_v6.out], [reply_bfd_v6.pid])
+NS_CHECK_EXEC([bgp-daemon], [echo "from bgp-daemon: BFD IPv6 client traffic" | nc -u -6 fe80::210:10ff:fe01:213%bgp-daemon 3784])
+AT_CHECK([cat ext-foo_bfd_v6.out], [0], [dnl
+from bgp-daemon: BFD IPv6 client traffic
+])
+
+# Verify that hosts on the internal network can reach external networks
+NETNS_DAEMONIZE([ext-foo], [nc -l -k 172.16.1.100 2222], [nc_external.pid])
+NS_CHECK_EXEC([bar1], [echo "TCP test" | nc -w 1 --send-only 172.16.1.100 2222])
+
+OVN_CLEANUP_CONTROLLER([hv1])
+
+as ovn-sb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as ovn-nb
+OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+
+as northd
+OVS_APP_EXIT_AND_WAIT([ovn-northd])
+
+as
+OVS_TRAFFIC_VSWITCHD_STOP(["/.*error receiving.*/d
+/.*terminating with signal 15.*/d"])
 AT_CLEANUP
 ])

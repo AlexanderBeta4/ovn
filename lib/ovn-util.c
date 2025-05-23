@@ -869,7 +869,7 @@ ip_address_and_port_from_lb_key(const char *key, char **ip_address,
  *
  * NOTE: If OVN_NORTHD_PIPELINE_CSUM is updated make sure to double check
  * whether an update of OVN_INTERNAL_MINOR_VER is required. */
-#define OVN_NORTHD_PIPELINE_CSUM "962040559 9628"
+#define OVN_NORTHD_PIPELINE_CSUM "2839329900 9927"
 #define OVN_INTERNAL_MINOR_VER 8
 
 /* Returns the OVN version. The caller must free the returned value. */
@@ -1180,6 +1180,8 @@ get_lport_type(const struct sbrec_port_binding *pb)
         return LP_REMOTE;
     } else if (!strcmp(pb->type, "vtep")) {
         return LP_VTEP;
+    } else if (!strcmp(pb->type, "mirror")) {
+        return LP_MIRROR;
     }
 
     return LP_UNKNOWN;
@@ -1193,6 +1195,8 @@ get_lport_type_str(enum en_lport_type lport_type)
         return "VIF";
     case LP_CONTAINER:
         return "CONTAINER";
+    case LP_MIRROR:
+        return "MIRROR";
     case LP_VIRTUAL:
         return "VIRTUAL";
     case LP_PATCH:
@@ -1234,6 +1238,7 @@ is_pb_router_type(const struct sbrec_port_binding *pb)
 
     case LP_VIF:
     case LP_CONTAINER:
+    case LP_MIRROR:
     case LP_VIRTUAL:
     case LP_LOCALNET:
     case LP_LOCALPORT:
@@ -1324,4 +1329,11 @@ ovn_debug_commands_register(void)
 {
     unixctl_command_register("debug/enable-timewarp", "", 0, 0,
                              ovn_enable_timewarp, NULL);
+}
+
+char *
+ovn_mirror_port_name(const char *datapath_name,
+                     const char *port_name)
+{
+    return xasprintf("mp-%s-%s", datapath_name, port_name);
 }
