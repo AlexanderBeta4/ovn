@@ -1536,7 +1536,7 @@ get_nat_gateway(const struct ovn_datapath *od,
                 const struct nbrec_nat *nat,
                 const struct hmap *lr_ports)
 {
-    static struct ovn_port *dgwp = NULL;
+    struct ovn_port *dgwp = NULL;
 
     if (nat->gateway_port) {
         dgwp = ovn_port_find(lr_ports, nat->gateway_port->name);
@@ -1555,9 +1555,7 @@ get_nat_gateway(const struct ovn_datapath *od,
         }
     }
 
-    if (dgwp
-        && (is_l3dgw_port(dgwp)
-            || is_nat_distributed(nat, od))) {
+    if (dgwp && (is_l3dgw_port(dgwp) || is_nat_distributed(nat, od))) {
         return dgwp;
     }
 

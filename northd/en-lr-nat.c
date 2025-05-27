@@ -124,7 +124,7 @@ collect_l3dgw_modified(const struct ovn_datapath *od,
         struct ovn_port *gwp =
             get_nat_gateway(od, lrnat_rec->nat_entries[i].nb, lr_ports);
 
-        if (gwp) {
+        if (gwp && gwp->peer && gwp->peer->od) {
             hmapx_add(portsmap, gwp->peer->od);
         }
     }
