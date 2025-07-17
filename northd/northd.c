@@ -11716,13 +11716,7 @@ parsed_routes_add_static(const struct ovn_datapath *od,
                                          "ecmp_symmetric_reply",
                                          false);
 
-    enum route_source source;
-    if (!strcmp(smap_get_def(&route->options, "origin", ""),
-                ROUTE_ORIGIN_CONNECTED)) {
-        source = ROUTE_SOURCE_CONNECTED;
-    } else {
-        source = ROUTE_SOURCE_STATIC;
-    }
+    enum route_source source = ROUTE_SOURCE_STATIC;
 
     parsed_route_add(od, nexthop, &prefix, plen, is_discard_route, lrp_addr_s,
                      out_port, route_table_id, is_src_route,
