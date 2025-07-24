@@ -104,7 +104,7 @@ EXTRA_DIST = \
 	$(MAN_ROOTS) \
 	make-sources \
 	ovn-fedora.spec \
-	openvswitch-3.5.0.tar.gz.shadow \
+	openvswitch-3.5.90.tar.gz.shadow \
 	Vagrantfile \
 	Vagrantfile-FreeBSD \
 	.mailmap \
