@@ -256,8 +256,7 @@ ls_stateful_lr_nat_handler(struct engine_node *node, void *data_)
             &data->table, od->nbs);
         ovs_assert(ls_stateful_rec);
 
-        ls_stateful_record_reinit(ls_stateful_rec, od, NULL,
-                                  input_data.ls_port_groups);
+        ls_stateful_record_init(ls_stateful_rec, od, input_data.ls_port_groups);
 
         /* Add the ls_stateful_rec to the tracking data. */
         hmapx_add(&data->trk_data.crupdated, ls_stateful_rec);
