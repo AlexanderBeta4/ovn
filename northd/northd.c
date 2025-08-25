@@ -9302,18 +9302,12 @@ build_lswitch_arp_chassis_resident(const struct ovn_datapath *od,
             if (is_nat_gateway_port(nat, op_r)
                 && is_nat_distributed(nat, op_r->od)) {
                 ds_clear(&match);
-/*                ds_put_format(&match,
+                ds_put_format(&match,
                               REGBIT_EXT_ARP
                               " == 1 && is_chassis_resident(\"%s\")",
                               nat->logical_port);
-*/
-            ds_put_format(&match,
-                          REGBIT_EXT_ARP" == 1 && is_chassis_resident(%s)",
-                          op_r->json_key);
-
                 ovn_lflow_add(lflows, od, S_SWITCH_IN_APPLY_PORT_SEC, 75,
                               ds_cstr(&match), "next;", lflow_ref);
-                break;
             }
         }
     }
