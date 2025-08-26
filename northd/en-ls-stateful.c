@@ -57,7 +57,6 @@ static void ls_stateful_table_build(struct ls_stateful_table *,
 
 static struct ls_stateful_input ls_stateful_get_input_data(
     struct engine_node *);
-
 static struct ls_stateful_record *ls_stateful_record_create(
     struct ls_stateful_table *,
     const struct ovn_datapath *,
@@ -73,8 +72,6 @@ static void ls_stateful_record_set_acls(
     const struct ls_port_group_table *);
 static void ls_stateful_record_set_acls_(struct ls_stateful_record *,
                                          struct nbrec_acl **, size_t n_acls);
-static struct ls_stateful_input ls_stateful_get_input_data(
-    struct engine_node *);
 
 struct ls_stateful_input {
     const struct ls_port_group_table *ls_port_groups;
@@ -235,6 +232,58 @@ ls_stateful_acl_handler(struct engine_node *node, void *data_)
     return EN_HANDLED_UNCHANGED;
 }
 
+/*
+    Return list of datapaths, assumed lswitch, that are gateways for given nat
+*/
+static struct hmapx nat_odmap_create(struct lr_nat_record *nr)
+{
+    struct hmapx odmap = HMAPX_INITIALIZER(&odmap);
+
+    for (int i = 0; i < nr->n_nat_entries; i++) {
+        struct ovn_nat *ent = &nr->nat_entries[i];
+
+        if (ent->is_valid
+            && ent->l3dgw_port
+            && ent->l3dgw_port->peer
+            && ent->l3dgw_port->peer->od
+            && !ent->is_distributed) {
+            hmapx_add(&odmap, ent->l3dgw_port->peer->od);
+        }
+    }
+
+    return odmap;
+}
+
+/*
+    Return the set R = (A\B + B\A),
+    i.e. elements that were modified in event.
+*/
+static struct hmapx nat_odmap_mod(struct lr_nat_record *nr_old,
+                                  struct lr_nat_record *nr_cur)
+{
+    struct hmapx mod = HMAPX_INITIALIZER(&mod);
+    struct hmapx old = nat_odmap_create(nr_old);
+    struct hmapx cur = nat_odmap_create(nr_cur);
+
+    struct hmapx_node *hmapx_node;
+    HMAPX_FOR_EACH (hmapx_node, &old) {
+        if (!hmapx_find(&cur, hmapx_node->data)) {
+            hmapx_add(&mod, hmapx_node->data);
+        }
+    }
+
+    HMAPX_FOR_EACH (hmapx_node, &cur) {
+        if (!hmapx_find(&old, hmapx_node->data)) {
+            hmapx_add(&mod, hmapx_node->data);
+        }
+    }
+
+    hmapx_destroy(&old);
+    hmapx_destroy(&cur);
+
+    return mod;
+}
+
 enum engine_input_handler_result
 ls_stateful_lr_nat_handler(struct engine_node *node, void *data_)
 {
@@ -245,21 +294,45 @@ ls_stateful_lr_nat_handler(struct engine_node *node, void *data_)
         return EN_UNHANDLED;
     }
 
-    struct ls_stateful_input input_data = ls_stateful_get_input_data(node);
     struct ed_type_ls_stateful *data = data_;
-
+    struct hmapx review = HMAPX_INITIALIZER(&review);
     struct hmapx_node *hmapx_node;
-    HMAPX_FOR_EACH (hmapx_node, &lr_nat_data->trk_data.mod_l3dgw) {
-        const struct ovn_datapath *od = hmapx_node->data;
 
-        struct ls_stateful_record *ls_stateful_rec = ls_stateful_table_find_(
-            &data->table, od->nbs);
-        ovs_assert(ls_stateful_rec);
+    HMAPX_FOR_EACH (hmapx_node, &lr_nat_data->trk_data.crupdated) {
+        struct lr_nat_record *nr_cur = hmapx_node->data;
+        struct hmapx_node *n_nr_old = hmapx_find(&data->table.nat_records, nr_cur);
 
-        ls_stateful_record_init(ls_stateful_rec, od, input_data.ls_port_groups);
+        if (n_nr_old) {
+            review = nat_odmap_mod(n_nr_old->data, nr_cur);
+        } else {
+            review = nat_odmap_create(nr_cur);
+        }
 
-        /* Add the ls_stateful_rec to the tracking data. */
-        hmapx_add(&data->trk_data.crupdated, ls_stateful_rec);
+        hmapx_add(&data->table.nat_records, nr_cur);
+
+        struct hmapx_node *hmapx_node2;
+        HMAPX_FOR_EACH (hmapx_node2, &review) {
+            const struct ovn_datapath *od = hmapx_node2->data;
+
+            struct ls_stateful_record *ls_stateful_rec
+                = ls_stateful_table_find_(&data->table, od->nbs);
+            ovs_assert(ls_stateful_rec);
+
+            /* Add the ls_stateful_rec to the tracking data. */
+            hmapx_add(&data->trk_data.crupdated, ls_stateful_rec);
+        }
+
+        hmapx_destroy(&review);
+
+        //  Find nr in nat_records
+        //  If found then A := nat_records[i].odmap
+        //    Create B := new_odmap from nr
+        //    reviewMap = A\B + B\A
+        //    Trigger ls from reviewMap
+        //  Else
+        //    Trigger ls from B
+        //  End
+        //  Save nr + B -> nat_records
     }
 
     if (ls_stateful_has_tracked_data(&data->trk_data)) {
@@ -275,6 +348,7 @@ ls_stateful_table_init(struct ls_stateful_table *table)
 {
     *table = (struct ls_stateful_table) {
         .entries = HMAP_INITIALIZER(&table->entries),
+        .nat_records = HMAPX_INITIALIZER(&table->nat_records),
     };
 }
 
@@ -283,6 +357,7 @@ ls_stateful_table_destroy(struct ls_stateful_table *table)
 {
     ls_stateful_table_clear(table);
     hmap_destroy(&table->entries);
+    hmapx_destroy(&table->nat_records);
 }
 
 static void

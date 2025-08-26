@@ -85,6 +85,7 @@ struct ls_stateful_record {
 
 struct ls_stateful_table {
     struct hmap entries;
+    struct hmapx nat_records;
 };
 
 #define LS_STATEFUL_TABLE_FOR_EACH(LS_STATEFUL_REC, TABLE) \
