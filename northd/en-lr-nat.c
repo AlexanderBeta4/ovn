@@ -83,7 +83,6 @@ en_lr_nat_init(struct engine_node *node OVS_UNUSED,
     struct ed_type_lr_nat_data *data = xzalloc(sizeof *data);
     lr_nat_table_init(&data->lr_nats);
     hmapx_init(&data->trk_data.crupdated);
-    hmapx_init(&data->trk_data.mod_l3dgw);
     return data;
 }
 
@@ -93,7 +92,6 @@ en_lr_nat_cleanup(void *data_)
     struct ed_type_lr_nat_data *data = (struct ed_type_lr_nat_data *) data_;
     lr_nat_table_destroy(&data->lr_nats);
     hmapx_destroy(&data->trk_data.crupdated);
-    hmapx_destroy(&data->trk_data.mod_l3dgw);
 }
 
 void
@@ -101,7 +99,6 @@ en_lr_nat_clear_tracked_data(void *data_)
 {
     struct ed_type_lr_nat_data *data = (struct ed_type_lr_nat_data *) data_;
     hmapx_clear(&data->trk_data.crupdated);
-    hmapx_clear(&data->trk_data.mod_l3dgw);
 }
 
 enum engine_node_state
@@ -117,23 +114,6 @@ en_lr_nat_run(struct engine_node *node, void *data_)
 
     stopwatch_stop(LR_NAT_RUN_STOPWATCH_NAME, time_msec());
     return EN_UPDATED;
-}
-
-static void
-collect_l3dgw_modified(struct lr_nat_record *lrnat_rec,
-                       struct hmapx *portsmap)
-{
-    for (int i = 0; i < lrnat_rec->n_nat_entries; i++) {
-        struct ovn_nat *ent = &lrnat_rec->nat_entries[i];
-
-        if (ent->is_valid
-            && ent->l3dgw_port
-            && ent->l3dgw_port->peer
-            && ent->l3dgw_port->peer->od
-            && !ent->is_distributed) {
-            hmapx_add(portsmap, ent->l3dgw_port->peer->od);
-        }
-    }
 }
 
 /* Handler functions. */
@@ -159,14 +139,10 @@ lr_nat_northd_handler(struct engine_node *node, void *data_)
         lrnat_rec = lr_nat_table_find_by_index_(&data->lr_nats, od->index);
         ovs_assert(lrnat_rec);
 
-        collect_l3dgw_modified(lrnat_rec, &data->trk_data.mod_l3dgw);
-
         lr_nat_record_reinit(lrnat_rec, od, &northd_data->lr_ports);
 
         /* Add the lrnet rec to the tracking data. */
         hmapx_add(&data->trk_data.crupdated, lrnat_rec);
-
-        collect_l3dgw_modified(lrnat_rec, &data->trk_data.mod_l3dgw);
     }
 
     if (lr_nat_has_tracked_data(&data->trk_data)) {

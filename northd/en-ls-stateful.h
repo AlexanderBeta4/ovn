@@ -81,11 +81,13 @@ struct ls_stateful_record {
      * access ls_stateful_record->lflow_ref at any given time.
      */
     struct lflow_ref *lflow_ref;
+
+    /* lr_nat_record ptrs that trigger this od to rebuild lflow */
+    struct hmapx nat_records;
 };
 
 struct ls_stateful_table {
     struct hmap entries;
-    struct hmapx nat_records;
 };
 
 #define LS_STATEFUL_TABLE_FOR_EACH(LS_STATEFUL_REC, TABLE) \
