@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef EN_LS_STATEFUL_H
-#define EN_LS_STATEFUL_H 1
+#ifndef EN_LS_ARP_H
+#define EN_LS_ARP_H 1
 
 #include <stdint.h>
 
@@ -26,7 +26,6 @@
 
 /* OVN includes. */
 #include "lib/inc-proc-eng.h"
-#include "lib/lb.h"
 #include "lib/ovn-nb-idl.h"
 #include "lib/ovn-sb-idl.h"
 #include "lib/ovn-util.h"
@@ -34,34 +33,20 @@
 
 struct lflow_ref;
 
-struct acl_tier {
-    uint64_t ingress_pre_lb;
-    uint64_t ingress_post_lb;
-    uint64_t egress;
-};
-
-struct ls_stateful_record {
+struct ls_arp_record {
     struct hmap_node key_node;
 
     /* UUID of the NB Logical switch. */
-    struct uuid nbs_uuid;
+/*    struct uuid nbs_uuid; */
 
     /* Unique id of the logical switch.  Note : This id is assigned
      * by the northd engine node for each logical switch. */
     size_t ls_index;
 
-    bool has_stateful_acl;
-    bool has_lb_vip;
-    bool has_acls;
-    struct acl_tier max_acl_tier;
-
-    /* Set of ACLs that are related to this LS. */
-    struct uuidset related_acls;
-
     /* 'lflow_ref' is used to reference logical flows generated for
-     * this ls_stateful record.
+     * this ls_arp record.
      *
-     * This data is initialized and destroyed by the en_ls_stateful node,
+     * This data is initialized and destroyed by the en_ls_arp node,
      * but populated and used only by the en_lflow node. Ideally this data
      * should be maintained as part of en_lflow's data.  However, it would
      * be less efficient and more complex:
@@ -78,50 +63,43 @@ struct ls_stateful_record {
      * never access it from any other nodes.
      *
      * Note: lflow_ref is not thread safe.  Only one thread should
-     * access ls_stateful_record->lflow_ref at any given time.
+     * access ls_arp_record->lflow_ref at any given time.
      */
     struct lflow_ref *lflow_ref;
+
+    /* lr_nat_record ptrs that trigger this od to rebuild lflow */
+    struct hmapx nat_records;
 };
 
-struct ls_stateful_table {
+struct ls_arp_table {
     struct hmap entries;
 };
 
-#define LS_STATEFUL_TABLE_FOR_EACH(LS_STATEFUL_REC, TABLE) \
-    HMAP_FOR_EACH (LS_STATEFUL_REC, key_node, &(TABLE)->entries)
+#define LS_ARP_TABLE_FOR_EACH(LS_ARP_REC, TABLE) \
+    HMAP_FOR_EACH (LS_ARP_REC, key_node, &(TABLE)->entries)
 
-#define LS_STATEFUL_TABLE_FOR_EACH_IN_P(LS_STATEFUL_REC, JOBID, TABLE) \
-    HMAP_FOR_EACH_IN_PARALLEL (LS_STATEFUL_REC, key_node, JOBID, \
+#define LS_ARP_TABLE_FOR_EACH_IN_P(LS_ARP_REC, JOBID, TABLE) \
+    HMAP_FOR_EACH_IN_PARALLEL (LS_ARP_REC, key_node, JOBID, \
                                &(TABLE)->entries)
 
-struct ls_stateful_tracked_data {
-    /* Created or updated logical switch with LB and ACL data. */
-    struct hmapx crupdated; /* Stores 'struct ls_stateful_record'. */
+struct ls_arp_tracked_data {
+    struct hmapx crupdated; /* Stores 'struct ls_arp_record'. */
 };
 
-struct ed_type_ls_stateful {
-    struct ls_stateful_table table;
-    struct ls_stateful_tracked_data trk_data;
+struct ed_type_ls_arp {
+    struct ls_arp_table table;
+    struct ls_arp_tracked_data trk_data;
 };
 
-void *en_ls_stateful_init(struct engine_node *, struct engine_arg *);
-void en_ls_stateful_cleanup(void *data);
-void en_ls_stateful_clear_tracked_data(void *data);
-enum engine_node_state en_ls_stateful_run(struct engine_node *, void *data);
+void *en_ls_arp_init(struct engine_node*, struct engine_arg*);
+void en_ls_arp_cleanup(void* data);
+void en_ls_arp_clear_tracked_data(void* data);
+enum engine_node_state en_ls_arp_run(struct engine_node*, void* data);
 
 enum engine_input_handler_result
-ls_stateful_northd_handler(struct engine_node *, void *data);
+ls_arp_lr_nat_handler(struct engine_node *node, void *data);
 enum engine_input_handler_result
-ls_stateful_port_group_handler(struct engine_node *, void *data);
-enum engine_input_handler_result
-ls_stateful_acl_handler(struct engine_node *node, void *data);
+ls_arp_northd_handler(struct engine_node *node, void *data);
 
-const struct ls_stateful_record *ls_stateful_table_find(
-    const struct ls_stateful_table *, const struct nbrec_logical_switch *);
+#endif /* EN_LS_ARP_H */
 
-static inline bool
-ls_stateful_has_tracked_data(struct ls_stateful_tracked_data *trk_data) {
-    return !hmapx_is_empty(&trk_data->crupdated);
-}
-
-#endif /* EN_LS_STATEFUL_H */

@@ -27,6 +27,7 @@
 #include "simap.h"
 #include "ovs-thread.h"
 #include "en-lr-stateful.h"
+#include "en-ls-arp.h"
 #include "vec.h"
 #include "datapath-sync.h"
 
@@ -254,6 +255,7 @@ struct lflow_input {
     const struct ls_port_group_table *ls_port_groups;
     const struct lr_stateful_table *lr_stateful_table;
     const struct ls_stateful_table *ls_stateful_table;
+    const struct ls_arp_table *ls_arp_table;
     const struct shash *meter_groups;
     const struct hmap *lb_datapaths_map;
     const struct sset *bfd_ports;
@@ -926,6 +928,10 @@ bool lflow_handle_ls_stateful_changes(struct ovsdb_idl_txn *,
                                       struct ls_stateful_tracked_data *,
                                       struct lflow_input *,
                                       struct lflow_table *lflows);
+bool lflow_handle_ls_arp_changes(struct ovsdb_idl_txn *,
+                                 struct ls_arp_tracked_data *,
+                                 struct lflow_input *,
+                                 struct lflow_table *lflows);
 bool northd_handle_sb_port_binding_changes(
     const struct sbrec_port_binding_table *, struct hmap *ls_ports,
     struct hmap *lr_ports);

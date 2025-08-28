@@ -50,6 +50,7 @@
 #include "en-lr-nat.h"
 #include "en-lr-stateful.h"
 #include "en-ls-stateful.h"
+#include "en-ls-arp.h"
 #include "en-multicast.h"
 #include "en-sampling-app.h"
 #include "en-datapath-logical-switch.h"
@@ -17622,9 +17623,6 @@ build_ls_stateful_flows(const struct ls_stateful_record *ls_stateful_rec,
     }
 
     build_lb_hairpin(ls_stateful_rec, od, lflows, ls_stateful_rec->lflow_ref);
-
-    build_lswitch_arp_chassis_resident(od, lflows,
-                                       ls_stateful_rec->lflow_ref);
 }
 
 struct lswitch_flow_build_info {
@@ -17970,6 +17968,8 @@ build_lflows_thread(void *arg)
                                             lsi->features,
                                             lsi->lflows,
                                             lsi->sbrec_acl_id_table);
+                    build_lswitch_arp_chassis_resident(od, lsi->lflows, ls_stateful_rec->lflow_ref);
+
                 }
             }
 
@@ -18196,6 +18196,7 @@ build_lswitch_and_lrouter_flows(
                                     lsi.features,
                                     lsi.lflows,
                                     lsi.sbrec_acl_id_table);
+            build_lswitch_arp_chassis_resident(od, lsi.lflows, ls_stateful_rec->lflow_ref);
         }
 
         ds_destroy(&lsi.match);
@@ -18693,6 +18694,41 @@ lflow_handle_ls_stateful_changes(struct ovsdb_idl_txn *ovnsb_txn,
         /* Sync the new flows to SB. */
         bool handled = lflow_ref_sync_lflows(
             ls_stateful_rec->lflow_ref, lflows, ovnsb_txn,
+            lflow_input->ls_datapaths,
+            lflow_input->lr_datapaths,
+            lflow_input->ovn_internal_version_changed,
+            lflow_input->sbrec_logical_flow_table,
+            lflow_input->sbrec_logical_dp_group_table);
+        if (!handled) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool
+lflow_handle_ls_arp_changes(struct ovsdb_idl_txn *ovnsb_txn,
+                            struct ls_arp_tracked_data *trk_data,
+                            struct lflow_input *lflow_input,
+                            struct lflow_table *lflows)
+{
+    struct hmapx_node *hmapx_node;
+
+    HMAPX_FOR_EACH (hmapx_node, &trk_data->crupdated) {
+        struct ls_stateful_record *ar = hmapx_node->data;
+        const struct ovn_datapath *od =
+            ovn_datapaths_find_by_index(lflow_input->ls_datapaths,
+                                        ar->ls_index);
+        lflow_ref_unlink_lflows(ar->lflow_ref);
+
+        /* Generate new lflows. */
+        build_lswitch_arp_chassis_resident(od, lflows, ar->lflow_ref);
+
+        /* Sync the new flows to SB. */
+
+        bool handled = lflow_ref_sync_lflows(
+            ar->lflow_ref, lflows, ovnsb_txn,
             lflow_input->ls_datapaths,
             lflow_input->lr_datapaths,
             lflow_input->ovn_internal_version_changed,
