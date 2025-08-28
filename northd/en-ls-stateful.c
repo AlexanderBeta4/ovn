@@ -53,19 +53,22 @@ static struct ls_stateful_record *ls_stateful_table_find_(
     const struct ls_stateful_table *, const struct nbrec_logical_switch *);
 static void ls_stateful_table_build(struct ls_stateful_table *,
                                     const struct ovn_datapaths *ls_datapaths,
-                                    const struct ls_port_group_table *);
+                                    const struct ls_port_group_table *,
+                                    const struct hmap *lr_nats);
 
 static struct ls_stateful_input ls_stateful_get_input_data(
     struct engine_node *);
 static struct ls_stateful_record *ls_stateful_record_create(
     struct ls_stateful_table *,
     const struct ovn_datapath *,
-    const struct ls_port_group_table *);
+    const struct ls_port_group_table *,
+    const struct hmap *lr_nats);
 static void ls_stateful_record_destroy(struct ls_stateful_record *);
 static void ls_stateful_record_init(
     struct ls_stateful_record *,
     const struct ovn_datapath *,
-    const struct ls_port_group_table *);
+    const struct ls_port_group_table *,
+    const struct hmap *lr_nats);
 static bool ls_has_lb_vip(const struct ovn_datapath *);
 static void ls_stateful_record_set_acls(
     struct ls_stateful_record *, const struct nbrec_logical_switch *,
@@ -76,6 +79,7 @@ static void ls_stateful_record_set_acls_(struct ls_stateful_record *,
 struct ls_stateful_input {
     const struct ls_port_group_table *ls_port_groups;
     const struct ovn_datapaths *ls_datapaths;
+    const struct hmap *lr_nats;
 };
 
 /* public functions. */
@@ -114,7 +118,7 @@ en_ls_stateful_run(struct engine_node *node, void *data_)
 
     ls_stateful_table_clear(&data->table);
     ls_stateful_table_build(&data->table, input_data.ls_datapaths,
-                          input_data.ls_port_groups);
+                          input_data.ls_port_groups, input_data.lr_nats);
 
     stopwatch_stop(LS_STATEFUL_RUN_STOPWATCH_NAME, time_msec());
     return EN_UPDATED;
@@ -359,11 +363,12 @@ ls_stateful_table_clear(struct ls_stateful_table *table)
 static void
 ls_stateful_table_build(struct ls_stateful_table *table,
                         const struct ovn_datapaths *ls_datapaths,
-                        const struct ls_port_group_table *ls_pgs)
+                        const struct ls_port_group_table *ls_pgs,
+                        const struct hmap *lr_nats)
 {
     const struct ovn_datapath *od;
     HMAP_FOR_EACH (od, key_node, &ls_datapaths->datapaths) {
-        ls_stateful_record_create(table, od, ls_pgs);
+        ls_stateful_record_create(table, od, ls_pgs, lr_nats);
     }
 }
 
@@ -385,16 +390,17 @@ ls_stateful_table_find_(const struct ls_stateful_table *table,
 static struct ls_stateful_record *
 ls_stateful_record_create(struct ls_stateful_table *table,
                           const struct ovn_datapath *od,
-                          const struct ls_port_group_table *ls_pgs)
+                          const struct ls_port_group_table *ls_pgs,
+                          const struct hmap *lr_nats)
 {
     struct ls_stateful_record *ls_stateful_rec =
         xzalloc(sizeof *ls_stateful_rec);
     ls_stateful_rec->ls_index = od->index;
     ls_stateful_rec->nbs_uuid = od->nbs->header_.uuid;
     uuidset_init(&ls_stateful_rec->related_acls);
-    ls_stateful_record_init(ls_stateful_rec, od, ls_pgs);
-    ls_stateful_rec->lflow_ref = lflow_ref_create();
     hmapx_init(&ls_stateful_rec->nat_records);
+    ls_stateful_record_init(ls_stateful_rec, od, ls_pgs, lr_nats);
+    ls_stateful_rec->lflow_ref = lflow_ref_create();
 
     hmap_insert(&table->entries, &ls_stateful_rec->key_node,
                 uuid_hash(&od->nbs->header_.uuid));
@@ -412,12 +418,32 @@ ls_stateful_record_destroy(struct ls_stateful_record *ls_stateful_rec)
 }
 
 static void
+ls_stateful_record_set_nats(struct ls_stateful_record *ls_stateful_rec,
+                            const struct hmap *nats)
+{
+    struct lr_nat_record *nr;
+    HMAP_FOR_EACH (nr, key_node, nats) {
+        struct hmapx B = HMAPX_INITIALIZER(&B);
+
+        nat_odmap_create(nr, &B);
+
+        if (find_by_index(&B, ls_stateful_rec->ls_index)) {
+            hmapx_add(&ls_stateful_rec->nat_records, nr);
+        }
+
+        hmapx_destroy(&B);
+    }
+}
+
+static void
 ls_stateful_record_init(struct ls_stateful_record *ls_stateful_rec,
                       const struct ovn_datapath *od,
-                      const struct ls_port_group_table *ls_pgs)
+                      const struct ls_port_group_table *ls_pgs,
+                      const struct hmap *lr_nats)
 {
     ls_stateful_rec->has_lb_vip = ls_has_lb_vip(od);
     ls_stateful_record_set_acls(ls_stateful_rec, od->nbs, ls_pgs);
+    ls_stateful_record_set_nats(ls_stateful_rec, lr_nats);
 }
 
 static bool
@@ -530,9 +556,13 @@ ls_stateful_get_input_data(struct engine_node *node)
         engine_get_input_data("northd", node);
     const struct port_group_data *pg_data =
         engine_get_input_data("port_group", node);
+    const struct ed_type_lr_nat_data *lr_nat_data =
+        engine_get_input_data("lr_nat", node);
 
     return (struct ls_stateful_input) {
         .ls_port_groups = &pg_data->ls_port_groups,
         .ls_datapaths = &northd_data->ls_datapaths,
+        .lr_nats = &lr_nat_data->lr_nats.entries,
     };
 }
+
