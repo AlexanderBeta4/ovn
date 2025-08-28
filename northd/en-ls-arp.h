@@ -36,9 +36,6 @@ struct lflow_ref;
 struct ls_arp_record {
     struct hmap_node key_node;
 
-    /* UUID of the NB Logical switch. */
-/*    struct uuid nbs_uuid; */
-
     /* Unique id of the logical switch.  Note : This id is assigned
      * by the northd engine node for each logical switch. */
     size_t ls_index;
