@@ -44,6 +44,16 @@ Post v25.09.0
        function and the chassis hosting the port where the ACL is being
        enforced). Proper MTU needs to be configured to accomodate this
        encapsulation.
+    - Change administrative distance for specific routes.
+      New AD is:
+        1. (new) Static (both local and ic-learned) high-proirity routes.
+        2. (new) Ic-learned connected routes that have route table ID set.
+        3. All other directly connected routes.
+        4. All other static routes.
+        5. routes learned from the outside via ovn-controller (e.g. bgp)
+        6. (lowest priority) src-ip routes
+      New option is introduced in order to mark static routes as priority
+      routes: override-connected.
 
 OVN v25.09.0 - xxx xx xxxx
 --------------------------
