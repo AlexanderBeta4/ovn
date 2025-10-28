@@ -399,6 +399,11 @@ static void ofctrl_meter_bands_clear(void);
  * S_CLEAR_FLOWS or S_UPDATE_FLOWS, this is really the option we have. */
 static enum mf_field_id mff_ovn_geneve;
 
+/* Полученное по запросу TLV из OF смещение в массиве tun metadata
+   для преставления route id */
+static enum mf_field_id mff_ovn_selector;
+
+
 /* Indicates if we just went through the S_CLEAR_FLOWS state, which means we
  * need to perform a one time deletion for all the existing flows, groups and
  * meters. This can happen during initialization or OpenFlow reconnection
@@ -490,6 +495,7 @@ process_tlv_table_reply(const struct ofputil_tlv_table_reply *reply)
     const struct ofputil_tlv_map *map;
     uint64_t md_free = UINT64_MAX;
     BUILD_ASSERT(TUN_METADATA_NUM_OPTS == 64);
+    uint8_t rc = 0;
 
     LIST_FOR_EACH (map, list_node, &reply->mappings) {
         if (map->option_class == OVN_GENEVE_CLASS
@@ -505,7 +511,26 @@ process_tlv_table_reply(const struct ofputil_tlv_table_reply *reply)
             } else {
                 mff_ovn_geneve = MFF_TUN_METADATA0 + map->index;
                 state = S_WAIT_BEFORE_CLEAR;
-                return true;
+                rc |= 1;
+                continue;
+            }
+        }
+
+        if (map->option_class == OVN_IC_EXTENT_CLASS
+            && map->option_type == OVN_FOREIGN_SELECTOR_TYPE
+            && map->option_len == 4 /* OVN_FOREIGN_SELECTOR_LEN */) {
+            if (map->index >= TUN_METADATA_NUM_OPTS) {
+                VLOG_ERR("desired IC foreign route 0x%"PRIx16","
+                         "%"PRIu8",%"PRIu8" already in use with "
+                         "unsupported index %"PRIu16,
+                         map->option_class, map->option_type,
+                         map->option_len, map->index);
+                return false;
+            } else {
+                mff_ovn_selector = MFF_TUN_METADATA0 + map->index;
+                state = S_WAIT_BEFORE_CLEAR;
+                rc |= 2;
+                continue;
             }
         }
 
@@ -514,6 +539,10 @@ process_tlv_table_reply(const struct ofputil_tlv_table_reply *reply)
         }
     }
 
+    /* Оба маппинга были установлены через командную строку */
+    if (rc == 3) return true;
+
+
     VLOG_DBG("OVN Geneve option not found");
     if (!md_free) {
         VLOG_ERR("no Geneve options free for use by OVN");
@@ -521,17 +550,32 @@ process_tlv_table_reply(const struct ofputil_tlv_table_reply *reply)
     }
 
     unsigned int index = rightmost_1bit_idx(md_free);
-    mff_ovn_geneve = MFF_TUN_METADATA0 + index;
-    struct ofputil_tlv_map tm;
-    tm.option_class = OVN_GENEVE_CLASS;
-    tm.option_type = OVN_GENEVE_TYPE;
-    tm.option_len = OVN_GENEVE_LEN;
-    tm.index = index;
 
+    struct ofputil_tlv_map tm;
+    struct ofputil_tlv_map tm2;
     struct ofputil_tlv_table_mod ttm;
+
     ttm.command = NXTTMC_ADD;
     ovs_list_init(&ttm.mappings);
-    ovs_list_push_back(&ttm.mappings, &tm.list_node);
+
+    if ( (rc & 1) == 0 ) {
+        mff_ovn_geneve = MFF_TUN_METADATA0 + index;
+        tm.option_class = OVN_GENEVE_CLASS;
+        tm.option_type = OVN_GENEVE_TYPE;
+        tm.option_len = OVN_GENEVE_LEN;
+        tm.index = index;
+        index += 4;
+        ovs_list_push_back(&ttm.mappings, &tm.list_node);
+    }
+
+    if ( (rc & 2) == 0 ) {
+        mff_ovn_selector = MFF_TUN_METADATA0 + index;
+        tm2.option_class = OVN_IC_EXTENT_CLASS;
+        tm2.option_type = OVN_FOREIGN_SELECTOR_TYPE;
+        tm2.option_len = 4  /* OVN_FOREIGN_SELECTOR_LEN */;
+        tm2.index = index;
+        ovs_list_push_back(&ttm.mappings, &tm2.list_node);
+    }
 
     xid = queue_msg(ofputil_encode_tlv_table_mod(OFP15_VERSION, &ttm));
     xid2 = queue_msg(ofputil_encode_barrier_request(OFP15_VERSION));
@@ -572,6 +616,7 @@ recv_S_TLV_TABLE_REQUESTED(const struct ofp_header *oh, enum ofptype type,
 
     /* Error path. */
     mff_ovn_geneve = 0;
+    mff_ovn_selector = 0;
     state = S_WAIT_BEFORE_CLEAR;
 }
 
@@ -777,6 +822,18 @@ ofctrl_get_mf_field_id(void)
             || state == S_CLEAR_FLOWS
             || state == S_UPDATE_FLOWS
             ? mff_ovn_geneve : 0);
+}
+
+enum mf_field_id
+ofctrl_get_selector_field_id(void)
+{
+    if (!rconn_is_connected(swconn)) {
+        return 0;
+    }
+    return (state == S_WAIT_BEFORE_CLEAR
+            || state == S_CLEAR_FLOWS
+            || state == S_UPDATE_FLOWS
+            ? mff_ovn_selector : 0);
 }
 
 /* Runs the OpenFlow state machine against 'br_int', which is local to the

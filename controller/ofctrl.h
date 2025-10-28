@@ -57,7 +57,10 @@ bool ofctrl_run(const char *conn_target, int probe_interval,
                 const struct ovsrec_open_vswitch_table *ovs_table,
                 struct shash *pending_ct_zones,
                 struct tracked_acl_ids *tracked_acl_ids);
+
 enum mf_field_id ofctrl_get_mf_field_id(void);
+enum mf_field_id ofctrl_get_selector_field_id(void);
+
 void ofctrl_put(struct ovn_desired_flow_table *lflow_table,
                 struct ovn_desired_flow_table *pflow_table,
                 struct shash *pending_ct_zones,

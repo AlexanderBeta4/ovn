@@ -11462,8 +11462,8 @@ build_route_table_lflow(struct ovn_datapath *od, struct lflow_table *lflows,
     }
 
     ds_put_format(&match, "inport == \"%s\"", lrp->name);
-    ds_put_format(&actions, "%s = %d; next;",
-                  REG_ROUTE_TABLE_ID, rtb_id);
+    ds_put_format(&actions, "%s = %d; selector = %d; next;",
+                  REG_ROUTE_TABLE_ID, rtb_id, rtb_id+4444);
 
     ovn_lflow_add(lflows, od, S_ROUTER_IN_IP_ROUTING_PRE, 100,
                   ds_cstr(&match), ds_cstr(&actions), lflow_ref);

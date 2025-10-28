@@ -43,6 +43,8 @@ enum ovn_controller_event {
 #define MFF_LOG_INPORT     MFF_REG14  /* Logical input port (32 bits). */
 #define MFF_LOG_OUTPORT    MFF_REG15  /* Logical output port (32 bits). */
 #define MFF_LOG_TUN_OFPORT MFF_REG5   /* 16..31 of the 32 bits */
+#define MFF_LOG_SELECTOR   MFF_REG3  /* Selector id (32-bit allocated, 16 used) */
+
 
 /* Logical registers.
  *

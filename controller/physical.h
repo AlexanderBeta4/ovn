@@ -43,6 +43,10 @@ struct local_nonvif_data;
 #define OVN_GENEVE_TYPE 0x80     /* Critical option. */
 #define OVN_GENEVE_LEN 4
 
+#define OVN_IC_EXTENT_CLASS 0x0103          /* Extension to be supplied for inter-az tunnel transfers. */
+#define OVN_FOREIGN_SELECTOR_TYPE 0x81      /* Foreign selector triggered. */
+#define OVN_FOREIGN_SELECTOR_LEN 2          /* uint16 selector ID */
+
 struct physical_debug {
     uint32_t collector_set_id;
     uint32_t obs_domain_id;
@@ -62,6 +66,7 @@ struct physical_ctx {
     struct hmap *local_datapaths;
     const struct shash *ct_zones;
     enum mf_field_id mff_ovn_geneve;
+    enum mf_field_id mff_ovn_selector;
     struct shash *local_bindings;
     struct simap *patch_ofports;
     struct hmap *chassis_tunnels;

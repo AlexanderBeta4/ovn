@@ -71,6 +71,7 @@ ovn_init_symtab(struct shash *symtab)
      * doesn't yet support string fields that occupy less than a full OXM. */
     expr_symtab_add_string(symtab, "inport", MFF_LOG_INPORT, NULL);
     expr_symtab_add_string(symtab, "outport", MFF_LOG_OUTPORT, NULL);
+    expr_symtab_add_string(symtab, "selector", MFF_LOG_SELECTOR, NULL);
 
     /* The port isn't reserved along the pipeline it's just defined as symbol
      * to support matching on string and moving between string registers. */

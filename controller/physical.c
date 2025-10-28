@@ -146,6 +146,7 @@ get_port_binding_tun(const struct sbrec_encap *remote_encap,
 
 static void
 put_encapsulation(enum mf_field_id mff_ovn_geneve,
+                  enum mf_field_id mff_ovn_selector,
                   const struct chassis_tunnel *tun,
                   const struct sbrec_datapath_binding *datapath,
                   uint16_t outport, bool is_ramp_switch,
@@ -155,6 +156,9 @@ put_encapsulation(enum mf_field_id mff_ovn_geneve,
         put_load(datapath->tunnel_key, MFF_TUN_ID, 0, 24, ofpacts);
         put_load(outport, mff_ovn_geneve, 0, 32, ofpacts);
         put_move(MFF_LOG_INPORT, 0, mff_ovn_geneve, 16, 15, ofpacts);
+        /* Переносим CONTEXT METADATA в TUN_METADATA */
+        put_move(MFF_LOG_SELECTOR, 0, mff_ovn_selector, 0, 16, ofpacts);
+
     } else if (tun->type == VXLAN) {
         uint64_t vni = datapath->tunnel_key;
         if (!is_ramp_switch) {
@@ -170,6 +174,7 @@ put_encapsulation(enum mf_field_id mff_ovn_geneve,
 
 static void
 put_decapsulation(enum mf_field_id mff_ovn_geneve,
+                  enum mf_field_id mff_ovn_selector,
                   const struct chassis_tunnel *tun,
                   struct ofpbuf *ofpacts)
 {
@@ -177,6 +182,8 @@ put_decapsulation(enum mf_field_id mff_ovn_geneve,
         put_move(MFF_TUN_ID, 0,  MFF_LOG_DATAPATH, 0, 24, ofpacts);
         put_move(mff_ovn_geneve, 16, MFF_LOG_INPORT, 0, 15, ofpacts);
         put_move(mff_ovn_geneve, 0, MFF_LOG_OUTPORT, 0, 16, ofpacts);
+        /* Переносим TUN_METADATA в CONTEXT METADATA */
+        put_move(mff_ovn_selector, 0, MFF_LOG_SELECTOR, 0, 16, ofpacts);
         put_load(ofp_to_u16(tun->ofport), MFF_LOG_TUN_OFPORT,
                  16, 16, ofpacts);
     } else if (tun->type == VXLAN) {
@@ -462,7 +469,7 @@ put_remote_port_redirect_overlay(const struct sbrec_port_binding *binding,
 
             const struct chassis_tunnel *tun;
             VECTOR_FOR_EACH (&tuns, tun) {
-                put_encapsulation(ctx->mff_ovn_geneve, tun, binding->datapath,
+                put_encapsulation(ctx->mff_ovn_geneve, ctx->mff_ovn_selector, tun, binding->datapath,
                                   port_key, is_vtep_port, ofpacts_clone);
                 ofpact_put_OUTPUT(ofpacts_clone)->port = tun->ofport;
             }
@@ -713,7 +720,9 @@ put_remote_port_redirect_overlay_ha_remote(
     const struct sbrec_port_binding *binding,
     const enum en_lport_type type,
     struct ha_chassis_ordered *ha_ch_ordered,
-    enum mf_field_id mff_ovn_geneve, uint32_t port_key,
+    enum mf_field_id mff_ovn_geneve,
+    enum mf_field_id mff_ovn_selector,
+    uint32_t port_key,
     struct match *match, struct ofpbuf *ofpacts_p,
     const struct hmap *chassis_tunnels,
     struct ovn_desired_flow_table *flow_table)
@@ -751,7 +760,7 @@ put_remote_port_redirect_overlay_ha_remote(
         return;
     }
 
-    put_encapsulation(mff_ovn_geneve, tun, binding->datapath, port_key,
+    put_encapsulation(mff_ovn_geneve, mff_ovn_selector, tun, binding->datapath, port_key,
                       type == LP_VTEP, ofpacts_p);
 
     /* Output to tunnels with active/backup */
@@ -1944,7 +1953,7 @@ enforce_tunneling_for_multichassis_ports(
 
         const struct chassis_tunnel *tun;
         VECTOR_FOR_EACH (&tuns, tun) {
-            put_encapsulation(ctx->mff_ovn_geneve, tun, binding->datapath,
+            put_encapsulation(ctx->mff_ovn_geneve, ctx->mff_ovn_selector, tun, binding->datapath,
                               port_key, is_vtep_port, &ofpacts);
             ofpact_put_OUTPUT(&ofpacts)->port = tun->ofport;
         }
@@ -2473,7 +2482,7 @@ consider_port_binding(const struct physical_ctx *ctx,
             &match, ofpacts_p, flow_table);
     } else if (access_type == PORT_HA_REMOTE) {
         put_remote_port_redirect_overlay_ha_remote(
-            binding, type, ha_ch_ordered, ctx->mff_ovn_geneve, port_key,
+            binding, type, ha_ch_ordered, ctx->mff_ovn_geneve, ctx->mff_ovn_selector, port_key,
             &match, ofpacts_p, ctx->chassis_tunnels, flow_table);
     } else {
         put_remote_port_redirect_overlay(
@@ -2500,6 +2509,7 @@ get_vxlan_port_key(int64_t port_key)
 /* Encapsulate and send to a single remote chassis. */
 static void
 tunnel_to_chassis(enum mf_field_id mff_ovn_geneve,
+                  enum mf_field_id mff_ovn_selector,
                   const char *chassis_name,
                   const struct hmap *chassis_tunnels,
                   const struct sbrec_datapath_binding *datapath,
@@ -2511,7 +2521,7 @@ tunnel_to_chassis(enum mf_field_id mff_ovn_geneve,
         return;
     }
 
-    put_encapsulation(mff_ovn_geneve, tun, datapath, outport, false,
+    put_encapsulation(mff_ovn_geneve, mff_ovn_selector, tun, datapath, outport, false,
                       remote_ofpacts);
     ofpact_put_OUTPUT(remote_ofpacts)->port = tun->ofport;
 }
@@ -2519,6 +2529,7 @@ tunnel_to_chassis(enum mf_field_id mff_ovn_geneve,
 /* Encapsulate and send to a set of remote chassis. */
 static void
 fanout_to_chassis(enum mf_field_id mff_ovn_geneve,
+                  enum mf_field_id mff_ovn_selector,
                   struct sset *remote_chassis,
                   const struct hmap *chassis_tunnels,
                   const struct sbrec_datapath_binding *datapath,
@@ -2535,7 +2546,7 @@ fanout_to_chassis(enum mf_field_id mff_ovn_geneve,
         }
 
         if (!prev || tun->type != prev->type) {
-            put_encapsulation(mff_ovn_geneve, tun, datapath,
+            put_encapsulation(mff_ovn_geneve, mff_ovn_selector, tun, datapath,
                               outport, is_ramp_switch, remote_ofpacts);
             prev = tun;
         }
@@ -2690,7 +2701,7 @@ consider_mc_group(const struct physical_ctx *ctx,
             if (port->chassis) {
                 put_load(port->tunnel_key, MFF_LOG_OUTPORT, 0, 32,
                          &remote_ctx->ofpacts);
-                tunnel_to_chassis(ctx->mff_ovn_geneve, port->chassis->name,
+                tunnel_to_chassis(ctx->mff_ovn_geneve, ctx->mff_ovn_selector, port->chassis->name,
                                   ctx->chassis_tunnels, mc->datapath,
                                   port->tunnel_key, &remote_ctx->ofpacts);
             }
@@ -2757,10 +2768,10 @@ consider_mc_group(const struct physical_ctx *ctx,
     if (remote_ports) {
         put_load(mc->tunnel_key, MFF_LOG_OUTPORT, 0, 32, &remote_ctx->ofpacts);
     }
-    fanout_to_chassis(ctx->mff_ovn_geneve, &remote_chassis,
+    fanout_to_chassis(ctx->mff_ovn_geneve, ctx->mff_ovn_selector, &remote_chassis,
                       ctx->chassis_tunnels, mc->datapath, mc->tunnel_key,
                       false, &remote_ctx->ofpacts);
-    fanout_to_chassis(ctx->mff_ovn_geneve, &vtep_chassis,
+    fanout_to_chassis(ctx->mff_ovn_geneve, ctx->mff_ovn_selector, &vtep_chassis,
                       ctx->chassis_tunnels, mc->datapath, mc->tunnel_key,
                       true, &remote_ctx->ofpacts);
 
@@ -2829,7 +2840,7 @@ physical_eval_remote_chassis_flows(const struct physical_ctx *ctx,
         ofpbuf_clear(&ingress_ofpacts);
         put_load(1, MFF_LOG_FLAGS, MLF_RX_FROM_TUNNEL_BIT, 1,
                  &ingress_ofpacts);
-        put_decapsulation(ctx->mff_ovn_geneve, tun, &ingress_ofpacts);
+        put_decapsulation(ctx->mff_ovn_geneve, ctx->mff_ovn_selector, tun, &ingress_ofpacts);
         put_resubmit(OFTABLE_LOG_INGRESS_PIPELINE, &ingress_ofpacts);
         if (tun->type == VXLAN) {
             /* VXLAN doesn't carry the inport information, we cannot set
@@ -3412,7 +3423,7 @@ physical_run(struct physical_ctx *p_ctx,
         match_set_in_port(&match, tun->ofport);
 
         ofpbuf_clear(&ofpacts);
-        put_decapsulation(p_ctx->mff_ovn_geneve, tun, &ofpacts);
+        put_decapsulation(p_ctx->mff_ovn_geneve, p_ctx->mff_ovn_selector, tun, &ofpacts);
 
         put_resubmit(OFTABLE_LOCAL_OUTPUT, &ofpacts);
         ofctrl_add_flow(flow_table, OFTABLE_PHY_TO_LOG, 100, 0, &match,
